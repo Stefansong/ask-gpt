@@ -117,17 +117,17 @@ CODEX_HOME=/path/to/.codex  ASK_GPT_CODEX=/path/to/codex  python3 scripts/ask_gp
 每次都问"你有订阅还是 API"很烦；完全不问又会在费用上替你做决定。所以按探测结果分流，**只在真正需要决策时才开口**：
 
 ```mermaid
-%%{init: {"flowchart": {"curve": "basis", "nodeSpacing": 30, "rankSpacing": 45}}}%%
+%%{init: {"flowchart": {"nodeSpacing": 30, "rankSpacing": 40}}}%%
 flowchart TD
     A(["⚡ 技能被触发"]) --> B("🔍 probe 探测<br/>不发任何请求")
-    B --> C{"已配置过？"}
+    B --> C{"已配置？"}
     C ==>|是| Z(["✅ 直接调用"])
-    C -->|否| D{"哪些路径可用？"}
+    C -->|否| D{"可用路径？"}
     D -->|只有订阅| E("用订阅<br/>一句话告知")
-    D -->|只有 API| F("用 API<br/>提醒按 token 计费")
+    D -->|只有 API| F("用 API<br/>按 token 计费")
     D -->|两条都有| G("🙋 问你选哪条<br/>费用差异大")
-    D -->|都没有| H("🙋 给出安装指引<br/>问你走哪条")
-    E & F & G --> J("💾 写入 config.json")
+    D -->|都没有| H("🙋 给安装指引<br/>问你走哪条")
+    E & F & G --> J("💾 写入<br/>config.json")
     J --> Z
     H -.->|配置好后| B
 
@@ -162,34 +162,28 @@ flowchart TD
 ## 架构：一套命令，两条路径
 
 ```mermaid
-%%{init: {"flowchart": {"curve": "basis", "nodeSpacing": 24, "rankSpacing": 40}}}%%
-flowchart LR
-    AG(["🤖 宿主 Agent<br/>Claude Code · Kimi Code · …"])
+%%{init: {"flowchart": {"nodeSpacing": 28, "rankSpacing": 36}}}%%
+flowchart TB
+    AG(["🤖 任意宿主 Agent"])
 
     subgraph CMD["统一命令面"]
-        direction TB
-        Q("💬 问答")
-        V("👁️ 读图 --see")
-        P("🎨 生图 --gen")
+        direction LR
+        Q("💬 问答") ~~~ V("👁️ 读图<br/>--see") ~~~ P("🎨 生图<br/>--gen")
     end
 
     R{{"🔀 路由<br/>config.json"}}
 
-    subgraph SUBP["订阅路径 · 包月额度，零额外账单"]
+    subgraph SUBP["订阅路径 · 零额外账单"]
         direction TB
-        S1("codex exec 只读沙箱")
-        S2("-i 多图输入")
-        S3("内置 image_gen")
+        S1("codex exec<br/>只读沙箱") ~~~ S2("-i 多图输入") ~~~ S3("内置 image_gen")
     end
 
     subgraph APIP["API 路径 · 按 token 计费"]
         direction TB
-        A1("POST /v1/responses")
-        A2("input_image base64")
-        A3("gpt-image-2")
+        A1("POST<br/>/v1/responses") ~~~ A2("input_image<br/>base64") ~~~ A3("gpt-image-2")
     end
 
-    M(["✨ GPT<br/>模型按账号实时拉取"])
+    M(["✨ GPT<br/>按账号拉取模型"])
 
     AG --> CMD --> R
     R -->|codex| SUBP
