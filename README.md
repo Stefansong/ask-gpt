@@ -119,7 +119,7 @@ CODEX_HOME=/path/to/.codex  ASK_GPT_CODEX=/path/to/codex  python3 scripts/ask_gp
 ```mermaid
 %%{init: {"flowchart": {"nodeSpacing": 30, "rankSpacing": 40}}}%%
 flowchart TD
-    A(["⚡ 技能被触发"]) --> B("🔍 probe 探测<br/>不发任何请求")
+    A(["⚡ 技能被触发"]) --> B("🔍 probe 探测<br/>只拉模型目录，不推理")
     B --> C{"已配置？"}
     C ==>|是| Z(["✅ 直接调用"])
     C -->|否| D{"可用路径？"}
@@ -211,11 +211,11 @@ flowchart TB
 
 | 能力 | 订阅路径 `codex` | API 路径 `api` |
 |---|---|---|
-| **计费** | ChatGPT 包月额度，**零额外账单** | **按 token 计费** |
+| **计费** | ChatGPT 账号登录：包月额度，**零额外账单**<br/>⚠️ codex 用 API Key 登录：同样按 token 计费 | **按 token 计费** |
 | **模型** | 按账号实时拉取（`codex debug models`） | 按账号实时拉取（`GET /v1/models`） |
 | **问答** | `codex exec` 只读沙箱 | `POST /v1/responses` |
 | **读图** | `codex exec -i`（客户端读文件后上传，可多张） | `input_image` base64 data URL |
-| **生图** | 内置 `image_gen` 工具 | `gpt-image-2` |
+| **生图** | 内置 `image_gen`，只读沙箱，从 codex 自己的目录取图 | `gpt-image-2` |
 | **生图尺寸** | 不可指定 | `--size` 精确控制 |
 | **额度耗尽** | `usage limit`，等订阅周期重置 | `429` 限速或余额不足 |
 
@@ -368,8 +368,9 @@ saved: /abs/path/out.png
  image_gen（Codex 内置）]
 ```
 
-**生完一定要核对文件存在** ——
-订阅路径的 `image_gen` 偶尔只给预览不落盘。
+**不会毁掉已有文件**：先校验是完整
+图片（查文件头和文件尾），再原子
+替换；失败时原文件保持不变。
 
 这张图本身就是测试产物，随后又用
 `--see` 反向识别为"橘白相间的猫坐在
@@ -400,13 +401,29 @@ python3 scripts/ask_gpt.py --json "Reply with exactly: OK"
 
 | 字段 | 含义 |
 |---|---|
-| `ok` | 是否成功；失败时另有 `error` |
+| `ok` | 是否成功 |
 | `mode` | `ask` / `see` / `gen` |
-| `path` / `billing` | `codex` + `subscription`，或 `api` + `per-token` |
+| `path` | `codex` 或 `api` |
+| `billing` | `subscription`（包月额度）/ `per-token`（按 token 计费）/ `unknown`（无法确认）—— **判断费用看它，不看路径名** |
 | `model` | **实际使用的模型名**，署名就用它 |
 | `answer` / `image` | 文本回答 / 生成图片的绝对路径 |
 
-退出码：`0` 成功，`1` 调用失败，`2` 无可用认证或未配置。
+**所有失败都是同一种结构**，包括参数错误。agent 按 `error_code` 分支即可，不必解析错误文本：
+
+```json
+{"ok": false, "error_code": "bad_input", "error": "图片不存在：/path/x.png"}
+```
+
+| `error_code` | 含义 | 退出码 |
+|---|---|---|
+| `call_failed` / `timeout` | 调用本身失败或超时 | `1` |
+| `bad_args` / `bad_input` | 参数或输入有误 | `2` |
+| `invalid_config` | 配置文件损坏或字段不合法 | `2` |
+| `no_auth` / `path_unavailable` / `path_not_chosen` / `no_models` | 认证或路径问题 | `2` |
+
+**成功判定是严格的**：codex 要求退出码 0、这一轮正常结束、回答非空；API 要求 `status=completed` 且有文本。被截断、拒答、半截输出都会报错，**不会当成 GPT 的回答返回**。
+
+`--probe` 会请求模型目录（`codex debug models` / `GET /v1/models`），但**不做任何模型推理**，不消耗推理额度。
 
 ### 配置管理
 
@@ -484,9 +501,16 @@ python3 scripts/ask_gpt.py --reset-config
 | `--json` 成功 / 失败结构 | ✅ | ✅ |
 | 模拟沙箱（独立 HOME + 最小 PATH + `CODEX_HOME`） | ✅ 问答成功，署名 `gpt-6.1-sol` | — |
 | 两条都可用时拒绝自动选 | ✅ 退出码 2 | |
+| codex 用 API Key 登录时识别为按 token 计费 | ✅ | — |
+| 生图异常返回时原文件不被破坏（含写了一半的图） | ✅ 单元测试 | ✅ 单元测试 |
+| 只读沙箱生图（不需要写工作目录） | ✅ macOS 实测，图片 md5 与 codex 目录一致 | — |
+| 不把失败 / 截断 / 拒答当成功 | ✅ 单元测试 | ✅ 单元测试 |
+| `--json` 下所有错误为统一结构 | ✅ 11 种错误场景 | ✅ |
+| 配置文件损坏或字段非法时明确报错 | ✅ | ✅ |
+| 相对路径的 `CODEX_HOME` / `ASK_GPT_CODEX` | ✅ 真实调用 | — |
 
 - **API 路径的真实响应未经真机验证** —— 开发环境没有 API Key
-- **宿主 agent**：在 Claude Code 中实测通过；Kimi Code 已核对 skill 格式兼容，尚未实际运行；WorkBuddy 等其他 agent 尚未测试。如果你在别的 agent 里跑通了（或踩到坑），欢迎开 issue
+- **宿主 agent**：在 Claude Code 中实测通过；Kimi Code 已核对 skill 格式兼容，尚未实际运行；**WorkBuddy（Windows）**实测发现订阅生图因沙箱禁止写工作目录而失败，v4.2 已改为只读沙箱方案，修复后**尚未在 Windows 上复测**。如果你在别的 agent 里跑通了（或踩到坑），欢迎开 issue
 
 ---
 
@@ -538,6 +562,57 @@ cmd = [exe, "exec", "-", "--skip-git-repo-check", "--ephemeral",
 ap.add_argument("--see", nargs="+")          # ✗ 会把后面的问题当成第二张图
 ap.add_argument("--see", action="append")    # ✓ 多图就重复 --see，和 codex 的 -i 一致
 ```
+
+</details>
+
+<details>
+<summary><b>5. codex 能用 ≠ 走订阅额度</b></summary>
+
+早期版本只要 `codex login status` 返回 0 就标成"订阅、零额外账单"。但 codex 也可以用 API Key 登录：
+
+```
+$ codex login status
+API key configured - sk-…        ← 退出码同样是 0
+```
+
+这时实际按 token 计费。用户看到"零额外账单"放心批量调用，最后收到账单。
+
+现在按登录方式判断：`Logged in using ChatGPT` → `subscription`，`API key` → `per-token`，认不出 → `unknown`（不假定免费）。
+
+</details>
+
+<details>
+<summary><b>6. 先截断再解码：一次异常返回就毁掉原图</b></summary>
+
+```python
+open(out_path, "wb").write(base64.b64decode(resp["data"][0]["b64_json"]))
+```
+
+Python 先执行 `open(…, "wb")`，**文件立刻被清空**，然后才去解析返回数据。返回里没有 `b64_json`、`data` 为空、base64 非法 —— 任何一种都会让用户原来的图变成 0 字节。最糟的是返回空字符串时**不报错**，还会报告生图成功。
+
+现在：先确认拿到的是完整图片（文件头 + 文件尾），再写同目录临时文件，`os.replace` 原子替换。
+
+</details>
+
+<details>
+<summary><b>7. 把错误响应当成 GPT 的回答</b></summary>
+
+```python
+return _extract_text(resp) or json.dumps(resp)[:2000]
+```
+
+API 返回 `status: incomplete`（被截断）、`failed` 或拒答时，提取不到文本，于是**原始 JSON 被当成回答返回**，`ok: true`。宿主 agent 会把这串 JSON 当成"GPT 说的话"展示给用户。codex 路径也有类似问题：退出码非 0 但写了半截回答，照样算成功。
+
+现在两条路径都严格判定，任何不完整的结果都报错。
+
+</details>
+
+<details>
+<summary><b>8. 沙箱不许写工作目录，生成的图拿不回来</b></summary>
+
+订阅路径原本让 codex 在 `workspace-write` 沙箱里把图写进工作目录再取回。WorkBuddy 在 Windows 上实测时，沙箱不允许写工作目录，这一步就断了。
+
+其实 codex 自己会把生成的图存到 `$CODEX_HOME/generated_images/<会话 ID>/`，这一步不经过沙箱。现在生图改用**只读沙箱**，从 `--json` 事件流的 `thread.started` 拿会话 ID，直接去那里取图 —— 不再需要任何写权限。
 
 </details>
 

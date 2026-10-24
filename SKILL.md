@@ -32,15 +32,22 @@ GPT 作为另一位参与者处理被交给它的那一步 —— 写好的段�
 python3 "$SCRIPT" --probe --json
 ```
 
-返回 `codex`（可用性、所用客户端及版本、其他副本、默认模型、账号可用模型）、`api`、`configured`、
-`config`、`proxy`。按五种分支处理：
+`--probe` **会请求模型目录**（`codex debug models` / `GET /v1/models`），但**不做任何模型推理**，不消耗推理额度。
+
+返回 `codex`（可用性、`auth_mode`、`billing`、所用客户端及版本、其他副本、默认模型、账号可用模型）、
+`api`、`configured`、`config`、`config_error`、`proxy`。
+
+**判断费用看 `codex.billing`，不要看路径名。** codex 用 ChatGPT 账号登录才是包月额度（`subscription`）；
+用 API Key 登录（`codex login --with-api-key`）同样按 token 计费（`per-token`）；认不出登录方式时是 `unknown`，
+不要假定免费。
 
 | 探测结果 | 你该做什么 |
 |---|---|
+| `config_error` 非空 | 把原因告诉用户，用 `--set-path` 重新选或 `--reset-config` 清掉 |
 | `configured: true` | **直接用，不要再问** |
-| 只有订阅可用 | 用订阅路径，一句话告知用户 |
+| 只有 codex 可用 | 用 codex。`billing` 为 `subscription` 时一句话告知；`per-token` 时**提醒按 token 计费**；`unknown` 时如实说无法确认是否计费 |
 | 只有 API 可用 | 用 API 路径，**提醒按 token 计费** |
-| 两条都可用 | **必须问用户选哪条** —— 费用差异大，不要替用户决定 |
+| 两条都可用 | **必须问用户选哪条** —— 费用可能不同，不要替用户决定 |
 | 两条都不可用 | 把「首次配置」两条都给用户，问他走哪条，配置好再继续 |
 
 需要问路径时给两个选项：
@@ -86,10 +93,29 @@ python3 "$SCRIPT" --gen /tmp/askgpt/out.png "图像描述"         # 生图
  "model": "<实际使用的模型>", "answer": "…", "images_in": []}
 ```
 
-生图返回 `"image": "<绝对路径>"`；失败返回 `"ok": false` 与 `"error"`。退出码：0 成功、1 调用失败、2 无可用认证或未配置。
+`billing` 取值：`subscription`（包月额度）/ `per-token`（按 token 计费）/ `unknown`（无法确认）。
+生图返回 `"image": "<绝对路径>"`。
 
-生图后**必须核对文件真的存在** —— 订阅路径的 `image_gen` 偶尔只给预览不落盘；不在就如实说明，
-并询问用户是否改走 API 路径。生成后把图展示给用户；医学示意图在图注注明"AI 生成，仅供参考"。
+**所有失败都是同一种结构**（包括参数错误），按 `error_code` 处理，不要解析 `error` 文本：
+
+```json
+{"ok": false, "error_code": "call_failed", "error": "…", "path": "codex", "billing": "subscription"}
+```
+
+| `error_code` | 含义 | 退出码 |
+|---|---|---|
+| `call_failed` / `timeout` | 调用本身失败或超时 | 1 |
+| `bad_args` / `bad_input` | 参数或输入有误（空 prompt、图片不存在、输出目录不存在等） | 2 |
+| `invalid_config` | 配置文件损坏或字段不合法 | 2 |
+| `no_auth` / `path_unavailable` / `path_not_chosen` / `no_models` | 认证或路径问题 | 2 |
+
+**成功判定是严格的**：codex 要求退出码 0、这一轮正常结束、回答非空；API 要求 `status=completed` 且有文本。
+被截断、拒答、半截输出都会报错，不会当成 GPT 的回答返回。
+
+**生图不会毁掉已有文件**：脚本先校验拿到的是完整图片（查文件头和文件尾），再原子替换目标文件；
+任何一步失败，目标路径上原有的文件保持不变。订阅路径用只读沙箱运行，从 codex 自己的
+`generated_images` 目录取图，**不需要沙箱有写权限**（Windows 等禁止写工作目录的环境也适用）。
+生成后把图展示给用户；医学示意图在图注注明"AI 生成，仅供参考"。
 
 ## 让 GPT 参与工作流的几种方式
 
@@ -107,6 +133,7 @@ python3 "$SCRIPT" --gen /tmp/askgpt/out.png "图像描述"         # 生图
 | 报错 | 处理 |
 |---|---|
 | `usage limit … try again at HH:MM` | 订阅额度用尽，告诉用户重置时间；若也有 API Key，问是否临时 `--path api` |
+| 订阅生图报"没有产出有效图片" | 当前账号或平台没有 `image_gen` 工具（Windows/WSL 已知问题）；如实告诉用户，问是否改走 API 路径 |
 | `model_not_found` / `not supported when using Codex` | 多半是**客户端太旧、不认识新模型**。看 `--probe` 里用的哪份 codex 及版本；脚本会自动选机器上版本最高的那份，若都旧就请用户升级（`brew upgrade --cask codex` 或 `npm i -g @openai/codex@latest`） |
 | `未找到 codex 可执行文件` | 沙箱里没有 codex，或 PATH 不同 —— 用 `ASK_GPT_CODEX` 指定 |
 | 读图时 GPT 说"看不到图" | 确认图片路径存在；脚本已把相对路径转绝对路径 |
@@ -119,7 +146,7 @@ python3 "$SCRIPT" --gen /tmp/askgpt/out.png "图像描述"         # 生图
 
 - **署名**：凡出自 GPT 的内容都标明「GPT（模型名，订阅/API 路径）」—— 模型名取 `--json` 返回的 `model`，
   与你自己的观点分开呈现，绝不静默混用。
-- **费用**：API 路径按 token 计费。单次直接跑；批量/循环调用、发大图或连续生图前，先说明大致用量。
+- **费用**：以 `billing` 字段为准 —— `per-token` 或 `unknown` 时，批量/循环调用、发大图或连续生图前，先说明大致用量。
 - **隐私**：发出前确认不含患者可识别信息（PHI）、密钥、未发表的敏感数据；医学影像和数据先去标识化，
   拿不准就先问用户。**`--probe` 显示 `HTTPS_PROXY` 或 `OPENAI_BASE_URL` 已设置时，请求可能经第三方网关转发，
   涉及敏感数据必须先告知用户。**

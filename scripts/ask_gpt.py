@@ -11,7 +11,7 @@
 再用 --set-path / --set-model 落盘。这样在工具调用里不会卡住。
 
 常用：
-  python3 ask_gpt.py --probe --json              # 探测两条路径+当前配置（不发任何请求）
+  python3 ask_gpt.py --probe --json              # 探测路径、登录方式与模型目录（会拉取模型目录，不做推理）
   python3 ask_gpt.py --set-path codex -M gpt-5.6-sol
   python3 ask_gpt.py "你的问题"                   # 问答
   python3 ask_gpt.py -f prompt.md                # 长 prompt 从文件读
@@ -19,7 +19,10 @@
   python3 ask_gpt.py --gen out.png -f desc.txt   # 生图
   python3 ask_gpt.py --path api "问题"            # 本次强制某路径
 
-退出码：0 成功；2 无可用认证 / 未配置；1 调用失败。
+退出码：0 成功；1 调用失败（error_code: call_failed / timeout）；
+        2 环境、配置或输入问题（bad_args / bad_input / invalid_config / no_auth /
+          path_not_chosen / path_unavailable / no_models）。
+加 --json 时，成功和失败都输出 JSON；失败统一为 {ok: false, error_code, error, ...}。
 """
 import argparse
 import base64
@@ -27,7 +30,6 @@ import json
 import mimetypes
 import re
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -66,19 +68,63 @@ SETUP_HINT = """两条路径，二选一：
 
 # ---------- 配置 ----------
 
+class Fail(Exception):
+    """可预期的失败，带稳定的 error_code；--json 时原样交给 agent 解析。
+    status：2 = 环境 / 配置 / 输入问题，1 = 调用本身失败。"""
+    def __init__(self, code, message, status=2, **extra):
+        super().__init__(message)
+        self.code, self.message, self.status, self.extra = code, message, status, extra
+
+
+CONFIG_KEYS = ("path", "model", "image_model")
+
+
+def _config_problems(cfg):
+    if not isinstance(cfg, dict):
+        return ["顶层必须是 JSON 对象"]
+    probs = []
+    if "path" in cfg and cfg["path"] not in ("codex", "api"):
+        probs.append('path 只能是 "codex" 或 "api"，现在是 %r' % (cfg["path"],))
+    for k in ("model", "image_model"):
+        if k in cfg and not (isinstance(cfg[k], str) and cfg[k].strip()):
+            probs.append("%s 必须是非空字符串" % k)
+    unknown = sorted(set(cfg) - set(CONFIG_KEYS))
+    if unknown:
+        probs.append("未知字段 %s" % ", ".join(unknown))
+    return probs
+
+
 def load_config():
+    """配置文件不存在 → 空配置；存在但损坏或字段不合法 → 明确报错，不静默当成空配置。"""
+    if not os.path.exists(CONFIG_PATH):
+        return {}
     try:
         with open(CONFIG_PATH, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+            cfg = json.load(f)
+    except Exception as e:
+        raise Fail("invalid_config", "配置文件 %s 无法解析（%s）。运行 --reset-config 后重新选择路径"
+                   % (CONFIG_PATH, e))
+    probs = _config_problems(cfg)
+    if probs:
+        raise Fail("invalid_config", "配置文件 %s 有误：%s。用 --set-path / --set-model 改正，"
+                   "或 --reset-config 重来" % (CONFIG_PATH, "；".join(probs)))
+    return cfg
 
 
 def save_config(cfg):
-    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
-        f.write("\n")
+    """写同目录临时文件再原子替换，中途出错不会留下半截配置。"""
+    d = os.path.dirname(CONFIG_PATH)
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".config_", suffix=".tmp", dir=d)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.replace(tmp, CONFIG_PATH)
+    except Exception:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
 
 
 # ---------- 探测 ----------
@@ -125,7 +171,34 @@ def find_codex():
     return max(installs, key=lambda i: _version_key(i["version"]))["path"]
 
 
+CODEX_BILLING = {"chatgpt": "subscription", "apikey": "per-token", "unknown": "unknown"}
+
+
+def codex_auth_mode(status_text):
+    """codex 能用不等于走订阅：用 ChatGPT 账号登录才消耗包月额度，
+    用 API Key 登录（codex login --with-api-key）同样按 token 计费。
+    以 `codex login status` 的输出为准，auth.json 的 auth_mode 兜底；
+    都认不出就标 unknown —— 宁可说不确定，也不默认当成免费。"""
+    t = (status_text or "").lower()
+    if "api key" in t:            # 先判 API Key：两者都沾边时按更贵的算
+        return "apikey"
+    if "chatgpt" in t:
+        return "chatgpt"
+    try:
+        with open(os.path.join(codex_home(), "auth.json"), encoding="utf-8") as f:
+            mode = (json.load(f).get("auth_mode") or "").lower()
+        if mode in ("chatgpt", "apikey"):
+            return mode
+    except Exception:
+        pass
+    return "unknown"
+
+
 def codex_state():
+    ch = os.environ.get("CODEX_HOME")
+    if ch and not os.path.isdir(ch):
+        return {"available": False, "exe": find_codex(), "auth_mode": None, "billing": None,
+                "detail": "CODEX_HOME=%s 不存在" % ch}
     exe = find_codex()
     if not exe:
         forced = os.environ.get("ASK_GPT_CODEX")
@@ -139,7 +212,10 @@ def codex_state():
     except Exception as e:
         return {"available": False, "exe": exe, "detail": "codex login status 执行失败: %s" % e}
     detail = (r.stdout or r.stderr or "").strip().splitlines()
+    mode = codex_auth_mode("\n".join(detail)) if r.returncode == 0 else None
     return {"available": r.returncode == 0, "exe": exe,
+            "auth_mode": mode,
+            "billing": CODEX_BILLING[mode] if mode else None,
             "version": codex_version(exe),
             "default_model": codex_default_model(),
             "detail": (detail[0] if detail else "退出码 %s" % r.returncode) + (
@@ -255,7 +331,12 @@ def api_state():
 
 
 def probe():
-    cfg = load_config()
+    """探测会请求模型目录（codex debug models / GET /v1/models），但不做任何模型推理。
+    配置文件损坏时照样完成探测，把问题放进 config_error。"""
+    try:
+        cfg, cfg_err = load_config(), None
+    except Fail as e:
+        cfg, cfg_err = {}, e.message
     cx, ap = codex_state(), api_state()
     cx["installs"] = codex_installs()
     cx["models"] = codex_models() if cx["available"] else []
@@ -265,6 +346,7 @@ def probe():
         "api": ap,
         "config": cfg,
         "config_path": CONFIG_PATH,
+        "config_error": cfg_err,
         "configured": bool(cfg.get("path")),
         "both_available": cx["available"] and ap["available"],
         "proxy": {k: bool(os.environ.get(k))
@@ -284,40 +366,141 @@ def _codex_base(exe, workdir, sandbox, model, images):
     return cmd
 
 
+def _codex_events(stdout):
+    """解析 codex exec --json 的事件流（每行一个 JSON）。"""
+    events = []
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                events.append(json.loads(line))
+            except ValueError:
+                pass
+    return events
+
+
+def _codex_failure(events):
+    """事件流里的失败信号：turn.failed / error。"""
+    for ev in events:
+        if ev.get("type") in ("turn.failed", "error"):
+            err = ev.get("error") or ev.get("message") or ev
+            return err.get("message", json.dumps(err, ensure_ascii=False)) \
+                if isinstance(err, dict) else str(err)
+    return None
+
+
 def codex_ask(exe, prompt, model, images, timeout):
     """空目录 + 只读沙箱：把 Codex 当纯聊天模型，碰不到任何项目文件。
-    图片由 CLI 在客户端读取后随 prompt 上传，不受沙箱限制。"""
+    图片由 CLI 在客户端读取后随 prompt 上传，不受沙箱限制。
+    成功须同时满足：退出码 0、事件流无失败信号且这一轮正常结束、回答非空。"""
     workdir = tempfile.mkdtemp(prefix="askgpt_")
     out = os.path.join(workdir, "answer.md")
-    cmd = _codex_base(exe, workdir, "read-only", model, images) + ["-o", out]
+    cmd = _codex_base(exe, workdir, "read-only", model, images) + ["--json", "-o", out]
     r = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
                        timeout=timeout, cwd=workdir)
+    events = _codex_events(r.stdout)
+    tail = (r.stderr or "").strip()[-900:]
+    failure = _codex_failure(events)
+    if r.returncode != 0 or failure:
+        raise RuntimeError("codex exec 失败（退出码 %s）%s。末尾输出：\n%s"
+                           % (r.returncode, "：" + failure if failure else "", tail))
+    if events and not any(ev.get("type") == "turn.completed" for ev in events):
+        raise RuntimeError("codex exec 没有正常结束这一轮（缺少 turn.completed）。末尾输出：\n%s" % tail)
+    ans = ""
     if os.path.exists(out):
-        ans = open(out, encoding="utf-8").read().strip()
-        if ans:
-            return ans
-    tail = (r.stderr or r.stdout or "").strip()[-900:]
-    raise RuntimeError("codex exec 未返回回答（退出码 %s）。末尾输出：\n%s" % (r.returncode, tail))
+        with open(out, encoding="utf-8") as f:
+            ans = f.read().strip()
+    if not ans:   # -o 没写出来时，从事件流里取最后一条非空回答
+        for ev in reversed(events):
+            it = ev.get("item") or {}
+            if ev.get("type") == "item.completed" and it.get("type") == "agent_message" \
+                    and (it.get("text") or "").strip():
+                ans = it["text"].strip()
+                break
+    if not ans:
+        raise RuntimeError("codex exec 正常结束但没有给出回答。末尾输出：\n%s" % tail)
+    return ans
+
+
+def _image_problem(data):
+    """None = 完整图片；否则返回原因。只看文件头会放过写了一半的文件，所以也查结尾。"""
+    if not data:
+        return "空文件"
+    if len(data) < 64:
+        return "只有 %d 字节" % len(data)
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return None if b"IEND" in data[-16:] else "PNG 不完整（缺少 IEND 结尾）"
+    if data.startswith(b"\xff\xd8\xff"):
+        return None if data.rstrip(b"\x00").endswith(b"\xff\xd9") else "JPEG 不完整（缺少结束标记）"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return None if data.rstrip(b"\x00").endswith(b";") else "GIF 不完整"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return None if len(data) >= int.from_bytes(data[4:8], "little") + 8 else "WEBP 不完整"
+    return "不是 PNG / JPEG / GIF / WEBP"
+
+
+def _looks_like_image(data):
+    return _image_problem(data) is None
+
+
+def _write_image_atomic(data, out_path):
+    """先确认是真图片，再写同目录临时文件并原子替换。
+    任何一步失败，目标路径上原有的文件都不会被动。"""
+    problem = _image_problem(data)
+    if problem:
+        raise RuntimeError("拿到的不是有效图片（%s），目标文件未改动" % problem)
+    d = os.path.dirname(os.path.abspath(out_path))
+    fd, tmp = tempfile.mkstemp(prefix=".askgpt_", suffix=".tmp", dir=d)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, out_path)
+    except Exception:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
 
 
 def codex_gen_image(exe, prompt, out_path, model, timeout):
-    """订阅生图：Codex 内置 image_gen 工具（feature image_generation 默认 stable/true）。"""
+    """订阅生图：Codex 内置 image_gen 工具。
+    不让 codex 往工作目录写文件 —— 有的平台沙箱不允许（如 Windows 上的 WorkBuddy）。
+    codex 自己会把生成的图存进 <CODEX_HOME>/generated_images/<会话 ID>/，这一步不经过沙箱，
+    所以用只读沙箱运行，从 --json 事件流拿会话 ID，再去那里取图。"""
     workdir = tempfile.mkdtemp(prefix="askgpt_img_")
     task = ("用你内置的图像生成工具画：\n%s\n\n"
-            "把最终图片保存为当前工作目录下的 image.png。"
-            "如果工具只返回预览而没落盘，就自行把图像字节写入 image.png。"
-            "完成后用 ls 确认文件确实存在。" % prompt)
-    cmd = _codex_base(exe, workdir, "workspace-write", model, None)
+            "生成即可，不要保存、复制或移动任何文件。" % prompt)
+    cmd = _codex_base(exe, workdir, "read-only", model, None) + ["--json"]
     r = subprocess.run(cmd, input=task, capture_output=True, text=True,
                        timeout=timeout, cwd=workdir)
-    imgs = [f for f in os.listdir(workdir)
-            if f.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))]
-    if not imgs:
-        tail = (r.stderr or r.stdout or "").strip()[-600:]
-        raise RuntimeError("Codex 未产出图像文件（已知问题：image_gen 偶尔只给预览不落盘；"
-                           "Windows/WSL 可能无此工具）。末尾输出：\n%s" % tail)
-    src = "image.png" if "image.png" in imgs else imgs[0]
-    shutil.copyfile(os.path.join(workdir, src), out_path)
+    events = _codex_events(r.stdout)
+    tail = (r.stderr or "").strip()[-600:]
+    failure = _codex_failure(events)
+    if r.returncode != 0 or failure:
+        raise RuntimeError("Codex 生图失败（退出码 %s）%s，目标文件未改动。末尾输出：\n%s"
+                           % (r.returncode, "：" + failure if failure else "", tail))
+    thread_id = next((ev.get("thread_id") for ev in events
+                      if ev.get("type") == "thread.started"), None)
+    candidates = []
+    if thread_id:
+        gen_dir = os.path.join(codex_home(), "generated_images", thread_id)
+        if os.path.isdir(gen_dir):
+            candidates += [os.path.join(gen_dir, f) for f in os.listdir(gen_dir)]
+    # 旧版 codex 可能把图直接落在工作目录
+    candidates += [os.path.join(workdir, f) for f in os.listdir(workdir)]
+    problems = []
+    for c in sorted((c for c in candidates if os.path.isfile(c)),
+                    key=os.path.getmtime, reverse=True):          # 最新的优先
+        with open(c, "rb") as f:
+            data = f.read()
+        problem = _image_problem(data)
+        if problem is None:
+            _write_image_atomic(data, out_path)
+            return
+        problems.append("%s: %s" % (os.path.basename(c), problem))
+    raise RuntimeError(
+        "Codex 本次没有产出有效图片%s，目标文件未改动。可能原因：当前账号或平台没有 image_gen 工具"
+        "（Windows/WSL 已知问题 openai/codex#19133）。末尾输出：\n%s"
+        % ("（%s）" % "；".join(problems) if problems else "", tail))
 
 
 # ---------- API 路径 ----------
@@ -328,17 +511,30 @@ def _api_post(path, payload, timeout):
         headers={"Authorization": "Bearer " + os.environ["OPENAI_API_KEY"],
                  "Content-Type": "application/json"})
     try:
-        return json.load(urllib.request.urlopen(req, timeout=timeout))
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = r.read()
     except urllib.error.HTTPError as e:
-        raise RuntimeError("OpenAI API 错误 %s: %s" % (e.code, e.read().decode()[:600]))
+        raise RuntimeError("OpenAI API 错误 %s: %s"
+                           % (e.code, e.read().decode("utf-8", "replace")[:600]))
     except urllib.error.URLError as e:
         raise RuntimeError("连不上 OpenAI（%s）。若设了 HTTPS_PROXY，请确认代理可用" % e.reason)
+    try:
+        return json.loads(body)
+    except ValueError:
+        raise RuntimeError("OpenAI 返回的不是 JSON（可能被代理或网关拦截）：%s"
+                           % body[:200].decode("utf-8", "replace"))
 
 
 def _extract_text(resp):
-    return "".join(c.get("text", "") for o in resp.get("output", [])
-                   if o.get("type") == "message" for c in o.get("content", [])
+    return "".join(c.get("text", "") for o in (resp.get("output") or [])
+                   if o.get("type") == "message" for c in (o.get("content") or [])
                    if c.get("type") == "output_text")
+
+
+def _extract_refusal(resp):
+    return "".join(c.get("refusal", "") for o in (resp.get("output") or [])
+                   if o.get("type") == "message" for c in (o.get("content") or [])
+                   if c.get("type") == "refusal")
 
 
 def api_ask(prompt, model, images, timeout):
@@ -354,30 +550,108 @@ def api_ask(prompt, model, images, timeout):
     else:
         payload = {"model": model, "input": prompt}
     resp = _api_post("/responses", payload, timeout)
-    return _extract_text(resp) or json.dumps(resp, ensure_ascii=False)[:2000]
+    # 成功须同时满足：没有 error、status 为 completed、有文本回答。
+    # 任何一项不满足都报错 —— 绝不把原始响应当成「GPT 的回答」返回。
+    if resp.get("error"):
+        raise RuntimeError("OpenAI 返回错误：%s" % json.dumps(resp["error"], ensure_ascii=False)[:400])
+    status = resp.get("status")
+    if status and status != "completed":
+        detail = resp.get("incomplete_details")
+        raise RuntimeError("OpenAI 响应未完成（status=%s）%s"
+                           % (status, "：" + json.dumps(detail, ensure_ascii=False) if detail else ""))
+    text = _extract_text(resp)
+    if text.strip():
+        return text
+    refusal = _extract_refusal(resp)
+    if refusal:
+        raise RuntimeError("GPT 拒绝回答：%s" % refusal)
+    raise RuntimeError("OpenAI 响应里没有文本回答")
 
 
 def api_gen_image(prompt, out_path, image_model, size, timeout):
     resp = _api_post("/images/generations",
                      {"model": image_model, "prompt": prompt, "size": size}, timeout)
-    open(out_path, "wb").write(base64.b64decode(resp["data"][0]["b64_json"]))
+    items = resp.get("data") or []
+    if not items:
+        raise RuntimeError("图像 API 没有返回图片，目标文件未改动：%s"
+                           % json.dumps(resp, ensure_ascii=False)[:300])
+    item = items[0]
+    if item.get("b64_json"):
+        try:
+            data = base64.b64decode("".join(item["b64_json"].split()), validate=True)
+        except Exception as e:
+            raise RuntimeError("图像 API 返回的 base64 无法解码，目标文件未改动：%s" % e)
+    elif item.get("url"):                       # dall-e 系列默认返回 url
+        data = urllib.request.urlopen(item["url"], timeout=timeout).read()
+    else:
+        raise RuntimeError("图像 API 返回格式无法识别，目标文件未改动：%s"
+                           % json.dumps(item, ensure_ascii=False)[:300])
+    _write_image_atomic(data, out_path)
 
 
 # ---------- 主流程 ----------
 
-def read_prompt(args, ap):
+def read_prompt(args):
     if args.file:
-        return open(args.file, encoding="utf-8").read()
-    if args.prompt:
-        return args.prompt
-    if not sys.stdin.isatty():
-        return sys.stdin.read()
-    ap.error("缺少 prompt：请给出参数、-f 文件或 stdin 输入")
+        try:
+            with open(args.file, encoding="utf-8") as f:
+                text = f.read()
+        except OSError as e:
+            raise Fail("bad_input", "读不到 prompt 文件 %s：%s" % (args.file, e.strerror or e))
+    elif args.prompt is not None:
+        text = args.prompt
+    elif not sys.stdin.isatty():
+        text = sys.stdin.read()
+    else:
+        raise Fail("bad_input", "缺少 prompt：请给出参数、-f 文件或 stdin 输入")
+    if not text.strip():
+        raise Fail("bad_input", "prompt 为空")
+    return text
+
+
+class _Parser(argparse.ArgumentParser):
+    """参数错误时，--json 模式也输出统一的 JSON 错误，而不是 argparse 的纯文本用法说明。"""
+    def error(self, message):
+        if "--json" in sys.argv[1:]:
+            print(json.dumps({"ok": False, "error_code": "bad_args", "error": message},
+                             ensure_ascii=False, indent=2))
+            sys.exit(2)
+        super().error(message)
+
+
+def _normalize_env():
+    """CODEX_HOME / ASK_GPT_CODEX 统一转成绝对路径并写回环境变量。
+    codex 是在临时目录里运行的，相对路径在那里会解析到别处。"""
+    for var in ("CODEX_HOME", "ASK_GPT_CODEX"):
+        v = os.environ.get(var)
+        if v:
+            os.environ[var] = os.path.abspath(os.path.expanduser(v))
+
+
+BILLING_TEXT = {
+    "subscription": "ChatGPT 包月订阅额度，不额外计费",
+    "per-token": "⚠️ 按 token 计费 —— codex 用的是 API Key 登录，不是订阅额度",
+    "unknown": "⚠️ 无法确认 —— 认不出 codex 的登录方式，不要假定免费",
+}
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(
-        description="调用你的 OpenAI 订阅 / API 问 GPT（问答 / 读图 / 生图）")
+    as_json = "--json" in sys.argv[1:]
+    try:
+        return _run(as_json)
+    except Fail as f:
+        out = {"ok": False, "error_code": f.code, "error": f.message}
+        out.update(f.extra)
+        if as_json:
+            print(json.dumps(out, ensure_ascii=False, indent=2))
+        else:
+            print(f.message, file=sys.stderr)
+        return f.status
+
+
+def _run(as_json):
+    _normalize_env()
+    ap = _Parser(description="调用你的 OpenAI 订阅 / API 问 GPT（问答 / 读图 / 生图）")
     ap.add_argument("prompt", nargs="?", help="问题文本；缺省时从 -f 或 stdin 读")
     ap.add_argument("-f", "--file", help="从文件读完整 prompt（长内容推荐）")
     ap.add_argument("--see", action="append", metavar="IMG",
@@ -388,57 +662,82 @@ def main() -> int:
     ap.add_argument("--path", choices=("codex", "api"), help="本次覆盖路径")
     ap.add_argument("--timeout", type=int, default=600, help="超时秒数（默认 600）")
     # 状态 / 配置
-    ap.add_argument("--probe", action="store_true", help="探测路径与配置，不发请求")
+    ap.add_argument("--probe", action="store_true",
+                    help="探测路径、登录方式与可用模型。会请求模型目录（codex debug models / "
+                         "GET /v1/models），但不做任何模型推理，不消耗推理额度")
     ap.add_argument("--list-models", action="store_true",
-                    help="列出当前路径实际可用的模型（运行时发现，非硬编码）")
+                    help="列出当前路径实际可用的模型（运行时从账号拉取，非硬编码）")
     ap.add_argument("--json", action="store_true",
-                    help="输出 JSON（问答/读图/生图/--probe 均适用），便于任意 agent 解析")
+                    help="所有结果与错误都输出 JSON，便于任意 agent 解析")
     ap.add_argument("--set-path", choices=("codex", "api"), help="写入默认路径")
     ap.add_argument("-M", "--set-model", help="写入默认文本模型")
     ap.add_argument("--set-image-model", help="写入默认生图模型（API 路径）")
     ap.add_argument("--show-config", action="store_true")
     ap.add_argument("--reset-config", action="store_true")
     args = ap.parse_args()
+    if args.timeout <= 0:
+        raise Fail("bad_args", "--timeout 必须是正整数")
 
-    # 配置类操作
-    if args.reset_config:
-        if os.path.exists(CONFIG_PATH):
-            os.remove(CONFIG_PATH)
-        print("已清除 %s" % CONFIG_PATH)
+    def done(payload, text):
+        if as_json:
+            print(json.dumps(dict({"ok": True}, **payload), ensure_ascii=False, indent=2))
+        else:
+            print(text)
         return 0
-    if args.set_path or args.set_model or args.set_image_model:
-        cfg = load_config()
+
+    # ---------- 配置类操作 ----------
+    if args.reset_config:
+        existed = os.path.exists(CONFIG_PATH)
+        if existed:
+            os.remove(CONFIG_PATH)
+        return done({"action": "reset", "config_path": CONFIG_PATH},
+                    "已清除 %s" % CONFIG_PATH if existed else "没有配置文件，无需清除")
+
+    if args.set_path or args.set_model is not None or args.set_image_model is not None:
+        warnings = []
+        try:
+            cfg = load_config()
+        except Fail as e:
+            cfg = {}
+            warnings.append("原配置无效，已重建：%s" % e.message)
         if args.set_path:
             cfg["path"] = args.set_path
-        if args.set_model:
+        if args.set_model is not None:
+            if not args.set_model.strip():
+                raise Fail("bad_args", "--set-model 不能为空")
             # 不做白名单拦截：发现列表可能滞后于 OpenAI 的实际上线情况
-            known = [m["id"] for m in models_for(args.set_path or cfg.get("path") or "codex")]
-            if known and args.set_model not in known:
-                print("提示：%s 不在当前发现到的模型里（%s）。仍然写入 —— "
-                      "新模型可能尚未进入本地缓存。" % (args.set_model, ", ".join(known)),
-                      file=sys.stderr)
-            cfg["model"] = args.set_model
-        if args.set_image_model:
-            cfg["image_model"] = args.set_image_model
+            known = [m["id"] for m in models_for(cfg.get("path") or "codex")]
+            if known and args.set_model.strip() not in known:
+                warnings.append("%s 不在当前发现到的模型里（%s）。仍然写入 —— 新模型可能尚未进入本地缓存"
+                                % (args.set_model.strip(), ", ".join(known)))
+            cfg["model"] = args.set_model.strip()
+        if args.set_image_model is not None:
+            if not args.set_image_model.strip():
+                raise Fail("bad_args", "--set-image-model 不能为空")
+            cfg["image_model"] = args.set_image_model.strip()
         save_config(cfg)
-        print("已写入 %s:\n%s" % (CONFIG_PATH, json.dumps(cfg, ensure_ascii=False, indent=2)))
-        return 0
+        if not as_json:
+            for w in warnings:
+                print("提示：" + w, file=sys.stderr)
+        return done({"action": "set", "config": cfg, "config_path": CONFIG_PATH,
+                     "warnings": warnings},
+                    "已写入 %s:\n%s" % (CONFIG_PATH, json.dumps(cfg, ensure_ascii=False, indent=2)))
+
     if args.show_config:
-        print(json.dumps(load_config(), ensure_ascii=False, indent=2) or "{}")
-        return 0
+        cfg = load_config()
+        return done({"config": cfg, "config_path": CONFIG_PATH},
+                    json.dumps(cfg, ensure_ascii=False, indent=2))
+
     if args.list_models:
         cfg = load_config()
-        path = args.path or cfg.get("path")
-        if not path:
-            path = "codex" if codex_state()["available"] else "api"
+        path = args.path or cfg.get("path") or ("codex" if codex_state()["available"] else "api")
         ms = models_for(path)
         if not ms:
-            print("未能发现模型（路径 %s）。订阅路径依赖 %s；API 路径需要 OPENAI_API_KEY。"
-                  % (path, codex_home()), file=sys.stderr)
-            return 2
+            raise Fail("no_models", "未能发现模型（路径 %s）。订阅路径需要 codex 已登录（数据目录 %s）；"
+                       "API 路径需要 OPENAI_API_KEY" % (path, codex_home()), path=path)
         dflt = cfg.get("model") or (codex_default_model() if path == "codex" else None)
         src = "账号实时目录（codex debug models）" if path == "codex" else "GET /v1/models"
-        print("路径 %s 当前可用模型 —— 来源：%s" % (path, src))
+        lines = ["路径 %s 当前可用模型 —— 来源：%s" % (path, src)]
         for m in ms:
             bits = []
             if m.get("context"):
@@ -446,38 +745,47 @@ def main() -> int:
             if m.get("vision") is True:
                 bits.append("支持图像输入")
             extra = ("  [%s]" % ", ".join(bits)) if bits else ""
-            star = "★" if m["id"] == dflt else " "
-            print(" %s %-20s %s%s" % (star, m["id"], m.get("desc") or m.get("label") or "", extra))
+            lines.append(" %s %-20s %s%s" % ("★" if m["id"] == dflt else " ", m["id"],
+                                             m.get("desc") or m.get("label") or "", extra))
         if dflt:
-            print("\n★ = 当前默认（%s）" % ("ask-gpt 配置" if cfg.get("model") else "你的 Codex 配置"))
-        print("换模型：%s --set-model <模型名>" % os.path.basename(__file__))
-        return 0
+            lines.append("\n★ = 当前默认（%s）" % ("ask-gpt 配置" if cfg.get("model") else "你的 Codex 配置"))
+        lines.append("换模型：%s --set-model <模型名>" % os.path.basename(__file__))
+        return done({"path": path, "source": src, "default": dflt, "models": ms}, "\n".join(lines))
 
     if args.probe:
         st = probe()
-        if args.json:
-            print(json.dumps(st, ensure_ascii=False, indent=2))
+        avail = st["codex"]["available"] or st["api"]["available"]
+        if as_json:
+            out = dict({"ok": avail}, **st)
+            if not avail:
+                out.update(error_code="no_auth", error="订阅与 API 两条路径都不可用")
+            print(json.dumps(out, ensure_ascii=False, indent=2))
         else:
-            print("订阅(codex): %s — %s" % ("可用" if st["codex"]["available"] else "不可用",
-                                            st["codex"]["detail"]))
-            if st["codex"].get("version"):
+            cx = st["codex"]
+            print("Codex CLI:   %s — %s" % ("可用" if cx["available"] else "不可用", cx["detail"]))
+            if cx["available"]:
+                print("  计费: %s" % BILLING_TEXT[cx["billing"]])
+            if cx.get("version"):
                 print("  使用: %s (%s) | 默认模型: %s"
-                      % (st["codex"]["exe"], st["codex"]["version"],
-                         st["codex"].get("default_model") or "未设置"))
-            others = [i for i in st["codex"].get("installs", []) if i["path"] != st["codex"]["exe"]]
-            for i in others:
-                print("  另有旧副本: %s (%s) —— 已自动跳过" % (i["path"], i["version"]))
-            if st["codex"]["models"]:
-                print("  账号可用模型: %s" % ", ".join(m["id"] for m in st["codex"]["models"]))
+                      % (cx["exe"], cx["version"], cx.get("default_model") or "未设置"))
+            for i in [i for i in cx.get("installs", []) if i["path"] != cx["exe"]]:
+                print("  另有副本: %s (%s) —— 已自动跳过" % (i["path"], i["version"]))
+            if cx["models"]:
+                print("  账号可用模型: %s" % ", ".join(m["id"] for m in cx["models"]))
             print("API Key:     %s — %s" % ("可用" if st["api"]["available"] else "不可用",
                                              st["api"]["detail"]))
             if st["api"]["available"] and st["api"].get("models"):
                 print("  可用模型: %d 个（--list-models 查看）" % len(st["api"]["models"]))
-            print("已配置: %s" % (json.dumps(st["config"], ensure_ascii=False)
-                                  if st["configured"] else "否（需先选路径）"))
-        return 0 if (st["codex"]["available"] or st["api"]["available"]) else 2
+            if st["config_error"]:
+                print("配置: ⚠️ %s" % st["config_error"])
+            else:
+                print("已配置: %s" % (json.dumps(st["config"], ensure_ascii=False)
+                                      if st["configured"] else "否（需先选路径）"))
+        return 0 if avail else 2
 
-    # 调用
+    # ---------- 调用 ----------
+    if args.gen and args.see:
+        raise Fail("bad_args", "--gen 与 --see 不能同时使用")
     cfg = load_config()
     cx, apst = codex_state(), api_state()
     path = args.path or cfg.get("path")
@@ -487,79 +795,80 @@ def main() -> int:
         elif apst["available"] and not cx["available"]:
             path = "api"
         elif cx["available"] and apst["available"]:
-            print("两条路径都可用，但尚未选定默认路径。\n"
-                  "请先选一条：ask_gpt.py --set-path codex   (订阅，不额外计费)\n"
-                  "            ask_gpt.py --set-path api     (API，按 token 计费)",
-                  file=sys.stderr)
-            return 2
+            raise Fail("path_not_chosen",
+                       "两条路径都可用，但尚未选定默认路径。先选一条：\n"
+                       "  --set-path codex   （%s）\n  --set-path api     （按 token 计费）"
+                       % BILLING_TEXT[cx["billing"] or "unknown"].lstrip("⚠️ "),
+                       codex_billing=cx["billing"])
         else:
-            print("未检测到可用的 OpenAI 认证。\n  订阅: %s\n  API:  %s\n\n%s"
-                  % (cx["detail"], apst["detail"], SETUP_HINT), file=sys.stderr)
-            return 2
-
+            raise Fail("no_auth", "未检测到可用的 OpenAI 认证。\n  订阅: %s\n  API:  %s\n\n%s"
+                       % (cx["detail"], apst["detail"], SETUP_HINT),
+                       codex_detail=cx["detail"], api_detail=apst["detail"])
     if path == "codex" and not cx["available"]:
-        print("配置为订阅路径，但 Codex 不可用：%s\n%s" % (cx["detail"], SETUP_HINT),
-              file=sys.stderr)
-        return 2
+        raise Fail("path_unavailable", "当前路径为 codex，但 Codex 不可用：%s" % cx["detail"],
+                   path="codex")
     if path == "api" and not apst["available"]:
-        print("配置为 API 路径，但 %s\n%s" % (apst["detail"], SETUP_HINT), file=sys.stderr)
-        return 2
+        raise Fail("path_unavailable", "当前路径为 api，但%s" % apst["detail"], path="api")
+
+    # 订阅路径会在临时空目录里运行 codex（隔离项目文件），相对路径在那里解析不到，
+    # 所以一律先转成绝对路径。
+    see = [os.path.abspath(os.path.expanduser(p)) for p in (args.see or [])]
+    missing = [p for p in see if not os.path.isfile(p)]
+    if missing:
+        raise Fail("bad_input", "图片不存在：%s" % ", ".join(missing))
+    gen_out = os.path.abspath(os.path.expanduser(args.gen)) if args.gen else None
+    if gen_out and not os.path.isdir(os.path.dirname(gen_out)):
+        raise Fail("bad_input", "生图输出目录不存在：%s" % os.path.dirname(gen_out))
+    prompt = read_prompt(args)
 
     model = resolve_model(path, args, cfg)
     image_model = (cfg.get("image_model") or os.environ.get("OPENAI_IMAGE_MODEL")
                    or FALLBACK_IMAGE_MODEL)
     model_tag = model or (codex_default_model() if path == "codex" else None) \
         or "Codex 默认模型"
-
-    # 读图前对模型做能力提示（只提示不拦截，元数据可能滞后）
-    if args.see and model:
-        for m in (codex_models(live=False) if path == "codex" else []):
-            if m["id"] == model and m.get("vision") is False:
-                print("提示：%s 的元数据未标注图像输入能力，读图可能失败。" % model,
-                      file=sys.stderr)
-                break
     size = args.size or os.environ.get("OPENAI_IMAGE_SIZE", "1024x1024")
 
-    # 订阅路径会在临时空目录里运行 codex（隔离项目文件），相对路径在那里解析不到，
-    # 所以一律先转成绝对路径。
-    args.see = [os.path.abspath(img) for img in (args.see or [])] or None
-    for img in (args.see or []):
-        if not os.path.isfile(img):
-            print("图片不存在：%s" % img, file=sys.stderr)
-            return 1
+    # 读图前对模型做能力提示（只提示不拦截，元数据可能滞后）
+    if see and model and not as_json:
+        for m in (codex_models(live=False) if path == "codex" else []):
+            if m["id"] == model and m.get("vision") is False:
+                print("提示：%s 的元数据未标注图像输入能力，读图可能失败。" % model, file=sys.stderr)
+                break
 
-    billing = "subscription" if path == "codex" else "per-token"
-    path_label = "ChatGPT 订阅 via codex exec" if path == "codex" else "OpenAI API（按 token 计费）"
+    billing = (cx.get("billing") or "unknown") if path == "codex" else "per-token"
+    path_label = {
+        ("codex", "subscription"): "ChatGPT 订阅 via codex exec",
+        ("codex", "per-token"):    "Codex CLI（API Key 登录，按 token 计费）",
+        ("codex", "unknown"):      "Codex CLI（登录方式未知，无法确认是否计费）",
+    }.get((path, billing), "OpenAI API（按 token 计费）")
     try:
-        if args.gen:
-            prompt = read_prompt(args, ap)
-            out = os.path.abspath(args.gen)
+        if gen_out:
             if path == "codex":
-                codex_gen_image(cx["exe"], prompt, out, model, args.timeout)
+                codex_gen_image(cx["exe"], prompt, gen_out, model, args.timeout)
                 used = "image_gen（Codex 内置）"
             else:
-                api_gen_image(prompt, out, image_model, size, args.timeout)
+                api_gen_image(prompt, gen_out, image_model, size, args.timeout)
                 used = "%s，%s" % (image_model, size)
             result = {"ok": True, "mode": "gen", "path": path, "billing": billing,
-                      "model": used, "image": out}
+                      "model": used, "image": gen_out}
         else:
-            prompt = read_prompt(args, ap)
-            if not prompt.strip():
-                ap.error("prompt 为空")
             if path == "codex":
-                answer = codex_ask(cx["exe"], prompt, model, args.see, args.timeout)
+                answer = codex_ask(cx["exe"], prompt, model, see or None, args.timeout)
             else:
-                answer = api_ask(prompt, model, args.see, args.timeout)
-            result = {"ok": True, "mode": "see" if args.see else "ask", "path": path,
+                answer = api_ask(prompt, model, see or None, args.timeout)
+            result = {"ok": True, "mode": "see" if see else "ask", "path": path,
                       "billing": billing, "model": model_tag, "answer": answer,
-                      "images_in": args.see or []}
+                      "images_in": see}
+    except subprocess.TimeoutExpired:
+        result = {"ok": False, "error_code": "timeout", "path": path, "billing": billing,
+                  "model": model_tag, "error": "超过 %d 秒未完成（--timeout 可调大）" % args.timeout}
     except Exception as e:
-        result = {"ok": False, "path": path, "billing": billing, "model": model_tag,
-                  "error": str(e)}
+        result = {"ok": False, "error_code": "call_failed", "path": path, "billing": billing,
+                  "model": model_tag, "error": str(e)}
 
     # --json：给任意 agent 解析用的稳定结构；否则沿用人类可读格式
     #（回答走 stdout，路径/模型标注走 stderr，方便管道里只取回答）
-    if args.json:
+    if as_json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     elif not result["ok"]:
         print("调用失败：%s" % result["error"], file=sys.stderr)
