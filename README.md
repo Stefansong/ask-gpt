@@ -100,11 +100,12 @@ sequenceDiagram
 所以要让 GPT 知道讨论和进展，由宿主 agent 写一份**背景简报**交给它：
 
 ```mermaid
-%%{init: {"flowchart": {"nodeSpacing": 26, "rankSpacing": 34}}}%%
-flowchart LR
+%%{init: {"flowchart": {"nodeSpacing": 30, "rankSpacing": 36}}}%%
+flowchart TB
     C(["💬 你和宿主 Agent<br/>的讨论"]) --> B("📝 宿主 Agent<br/>写背景简报")
-    F("📎 原始材料<br/>段落 / 代码 / 数据") --> P
+    F("📎 原始材料<br/>段落 · 代码 · 数据")
     B --> P{{"ask_gpt.py<br/>拼装背景与任务"}}
+    F --> P
     P --> G(["✨ GPT"])
     G --> R("回答回到<br/>同一个对话")
     R -.->|追问时写进进展| B
