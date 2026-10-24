@@ -42,7 +42,12 @@ API_BASE = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
 # 下面两个只是「发现失败时」的最后兜底，可被 config.json 或环境变量覆盖。
 FALLBACK_API_MODEL = "gpt-5.6-sol"
 FALLBACK_IMAGE_MODEL = "gpt-image-2"
-CODEX_MODELS_CACHE = os.path.expanduser("~/.codex/models_cache.json")
+
+
+def codex_home():
+    """Codex 数据目录（登录态、config.toml、模型缓存）。沙箱里 home 不同时用 CODEX_HOME 指定，
+    和 codex 自己的约定一致。"""
+    return os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
 
 CODEX_CANDIDATES = [
     "/opt/homebrew/bin/codex",
@@ -123,6 +128,10 @@ def find_codex():
 def codex_state():
     exe = find_codex()
     if not exe:
+        forced = os.environ.get("ASK_GPT_CODEX")
+        if forced:
+            return {"available": False, "exe": None,
+                    "detail": "ASK_GPT_CODEX=%s 不存在或不可执行" % forced}
         return {"available": False, "exe": None, "detail": "未找到 codex 可执行文件"}
     try:
         r = subprocess.run([exe, "login", "status"],
@@ -133,7 +142,9 @@ def codex_state():
     return {"available": r.returncode == 0, "exe": exe,
             "version": codex_version(exe),
             "default_model": codex_default_model(),
-            "detail": detail[0] if detail else "退出码 %s" % r.returncode}
+            "detail": (detail[0] if detail else "退出码 %s" % r.returncode) + (
+                "" if r.returncode == 0 or os.environ.get("CODEX_HOME") else
+                "（若在沙箱/容器里运行，可能读不到 ~/.codex，用 CODEX_HOME 指定）")}
 
 
 def _parse_catalog(data):
@@ -171,7 +182,7 @@ def codex_models(live=True, exe=None):
             except Exception:
                 pass
     try:
-        with open(CODEX_MODELS_CACHE, encoding="utf-8") as f:
+        with open(os.path.join(codex_home(), "models_cache.json"), encoding="utf-8") as f:
             return _parse_catalog(json.load(f))
     except Exception:
         return []
@@ -188,9 +199,9 @@ def codex_version(exe):
 
 
 def codex_default_model():
-    """读 ~/.codex/config.toml 顶层的 model =，仅用于署名，不修改它。"""
+    """读 <CODEX_HOME>/config.toml 顶层的 model =，仅用于署名，不修改它。"""
     try:
-        with open(os.path.expanduser("~/.codex/config.toml"), encoding="utf-8") as f:
+        with open(os.path.join(codex_home(), "config.toml"), encoding="utf-8") as f:
             for line in f:
                 if line.lstrip().startswith("["):  # 进入子表就停，只看顶层
                     break
@@ -423,7 +434,7 @@ def main() -> int:
         ms = models_for(path)
         if not ms:
             print("未能发现模型（路径 %s）。订阅路径依赖 %s；API 路径需要 OPENAI_API_KEY。"
-                  % (path, CODEX_MODELS_CACHE), file=sys.stderr)
+                  % (path, codex_home()), file=sys.stderr)
             return 2
         dflt = cfg.get("model") or (codex_default_model() if path == "codex" else None)
         src = "账号实时目录（codex debug models）" if path == "codex" else "GET /v1/models"
@@ -482,7 +493,8 @@ def main() -> int:
                   file=sys.stderr)
             return 2
         else:
-            print("未检测到可用的 OpenAI 认证。\n" + SETUP_HINT, file=sys.stderr)
+            print("未检测到可用的 OpenAI 认证。\n  订阅: %s\n  API:  %s\n\n%s"
+                  % (cx["detail"], apst["detail"], SETUP_HINT), file=sys.stderr)
             return 2
 
     if path == "codex" and not cx["available"]:

@@ -92,7 +92,15 @@ ask-gpt 本体是一个**零依赖的 Python 命令行脚本**，不绑定任何
 - **支持 skill 的 agent**（Claude Code、WorkBuddy 等）：把整个目录放进它的 skills 目录，`SKILL.md` 会告诉它何时触发、怎么问你、怎么解析结果
 - **不支持 skill 的 agent**：只要能跑 shell，直接调脚本；把 `SKILL.md` 的内容作为说明交给它即可
 
-沙箱里的 home 目录或 PATH 和你的机器不一样时，用 `CODEX_HOME` 指向 Codex 数据目录，用 `ASK_GPT_CODEX` 指定 codex 可执行文件。
+沙箱里的 home 目录或 PATH 和你的机器不一样时，用两个环境变量告诉它去哪找：
+
+```bash
+CODEX_HOME=/path/to/.codex  ASK_GPT_CODEX=/path/to/codex  python3 scripts/ask_gpt.py --probe
+```
+
+已在模拟沙箱（独立 HOME、PATH 只有 `/usr/bin:/bin`）里验证：设好后问答正常、署名为真实模型名；没设时 `--probe` 会直接提示该设哪个变量。
+
+> **Kimi Code** 的 skill 格式和本仓库完全一致（`name` / `description` frontmatter + `scripts/`），可直接放进 `~/.kimi-code/skills/`；不想安装也能临时试用：`kimi --skills-dir <含 ask-gpt 的目录>`。格式已核对，尚未实际运行。
 
 ---
 
@@ -204,6 +212,9 @@ git clone https://github.com/Stefansong/ask-gpt.git
 
 # Claude Code
 cp -r ask-gpt ~/.claude/skills/ask-gpt
+
+# Kimi Code
+cp -r ask-gpt ~/.kimi-code/skills/ask-gpt
 
 # 其他支持 skill 的 agent：放进它的 skills 目录（参照对应文档）
 # 不支持 skill 的 agent：直接调用 ask-gpt/scripts/ask_gpt.py 即可
@@ -423,10 +434,11 @@ python3 scripts/ask_gpt.py --reset-config
 | 账号模型实时拉取 | ✅ | ⚠️ 未经真机验证 |
 | 多份 codex 时选最高版本 | ✅ 跳过 npm 的 0.151.0，用 brew 的 0.164.0 | — |
 | `--json` 成功 / 失败结构 | ✅ | ✅ |
+| 模拟沙箱（独立 HOME + 最小 PATH + `CODEX_HOME`） | ✅ 问答成功，署名 `gpt-6.1-sol` | — |
 | 两条都可用时拒绝自动选 | ✅ 退出码 2 | |
 
 - **API 路径的真实响应未经真机验证** —— 开发环境没有 API Key
-- **目前只在 Claude Code 中实测过**；WorkBuddy 等其他 agent 尚未实测。如果你在别的 agent 里跑通了（或踩到坑），欢迎开 issue
+- **宿主 agent**：在 Claude Code 中实测通过；Kimi Code 已核对 skill 格式兼容，尚未实际运行；WorkBuddy 等其他 agent 尚未测试。如果你在别的 agent 里跑通了（或踩到坑），欢迎开 issue
 
 ---
 
