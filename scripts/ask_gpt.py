@@ -35,6 +35,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 
@@ -315,6 +316,7 @@ include_instructions = false
 """
 
 LAST_CONTEXT = {"clean": None, "reason": None}
+REQUIRE_CLEAN = {"on": False}     # --blind 时为 True：无法隔离就报错，不退回用户自己的 home
 
 
 def isolation_status():
@@ -326,39 +328,148 @@ def isolation_status():
     return True, None
 
 
-@contextlib.contextmanager
-def clean_codex_home():
-    """产出一个临时的干净 CODEX_HOME（或 None = 本次未隔离），用完即删。
-    auth.json 用链接指向真实文件：codex 刷新 token 时会顺着链接原地写回（已验证），
+def _prepare_clean_home(home):
+    """在 home 里放好指向真实凭据的 auth.json 链接，和只含必要设置的 config.toml。
+    成功返回 None，否则返回无法隔离的原因。可对同一目录反复调用（会话目录就是这样）。
+    auth.json 用链接而不是复制：codex 刷新 token 时会顺着链接原地写回（已验证），
     不会写进副本、随临时目录一起丢掉，从而把用户的主登录弄失效。"""
-    enabled, reason = isolation_status()
-    if not enabled:
-        LAST_CONTEXT.update(clean=False, reason=reason)
-        yield None
-        return
-    iso = tempfile.mkdtemp(prefix="askgpt_home_")
-    try:
-        real_auth, link = os.path.join(codex_home(), "auth.json"), os.path.join(iso, "auth.json")
+    real_auth = os.path.join(codex_home(), "auth.json")
+    link = os.path.join(home, "auth.json")
+    if os.path.lexists(link):
+        try:
+            stale = not os.path.samefile(link, real_auth)
+        except OSError:
+            stale = True
+        if stale:                       # 用户重新登录过，或换了 CODEX_HOME
+            os.remove(link)
+    if not os.path.lexists(link):
         try:
             os.symlink(real_auth, link)
         except OSError:
             try:
                 os.link(real_auth, link)          # Windows 无权限建符号链接时退回硬链接
             except OSError:
-                LAST_CONTEXT.update(clean=False, reason="无法链接登录凭据（符号链接与硬链接都不可用），本次未隔离")
-                yield None
-                return
-        top = ""
-        for key in ("model", "model_reasoning_effort"):   # 只沿用「用哪个模型、想多深」
-            v = _codex_config_value(key)
-            if v:
-                top += "%s = %s\n" % (key, json.dumps(v))
-        with open(os.path.join(iso, "config.toml"), "w", encoding="utf-8") as f:
-            f.write("# ask-gpt 生成的隔离配置，调用结束即删除\n" + top + ISOLATED_FEATURES)
+                return "无法链接登录凭据（符号链接与硬链接都不可用）"
+    top = 'sandbox_mode = "read-only"\n'          # 续接会话时不能传 -s，只读靠这里保证
+    for key in ("model", "model_reasoning_effort"):   # 只沿用「用哪个模型、想多深」
+        v = _codex_config_value(key)
+        if v:
+            top += "%s = %s\n" % (key, json.dumps(v))
+    with open(os.path.join(home, "config.toml"), "w", encoding="utf-8") as f:
+        f.write("# ask-gpt 生成的隔离配置\n" + top + ISOLATED_FEATURES)
+    return None
+
+
+def _not_clean(reason):
+    LAST_CONTEXT.update(clean=False, reason=reason)
+    if REQUIRE_CLEAN["on"]:
+        raise Fail("not_clean", "盲评要求上下文干净，但本次无法隔离：%s" % reason)
+
+
+@contextlib.contextmanager
+def clean_codex_home():
+    """产出一个临时的干净 CODEX_HOME（或 None = 本次未隔离），用完即删。"""
+    enabled, reason = isolation_status()
+    if not enabled:
+        _not_clean(reason)
+        yield None
+        return
+    iso = tempfile.mkdtemp(prefix="askgpt_home_")
+    try:
+        problem = _prepare_clean_home(iso)
+        if problem:
+            _not_clean(problem + "，本次未隔离")
+            yield None
+            return
         LAST_CONTEXT.update(clean=True, reason=None)
         yield iso
     finally:
         shutil.rmtree(iso, ignore_errors=True)    # 只删链接本身，不碰真实的 auth.json
+
+
+@contextlib.contextmanager
+def scratch_dir(prefix):
+    """调用用的临时工作目录，结束即删 —— 里面会有 GPT 的回答，不应留在磁盘上。"""
+    d = tempfile.mkdtemp(prefix=prefix)
+    try:
+        yield d
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# ---------- 多轮会话（可选） ----------
+#
+# 默认每次调用都从零开始。--session 名字 让 GPT 记得同一会话里的前几轮，适合和它反复
+# 打磨同一份东西；盲评（--blind）不允许用会话，避免被前几轮锚定。
+# 会话要持久保存，所以用 ask-gpt 专用的一个干净 CODEX_HOME（同样不含用户的 AGENTS.md /
+# 技能 / 插件），不往用户自己的 codex 会话历史里写东西。
+
+SESSIONS_DIR = os.path.join(os.path.dirname(CONFIG_PATH), "sessions")
+SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _sessions_index():
+    return os.path.join(SESSIONS_DIR, "index.json")
+
+
+def load_sessions():
+    try:
+        with open(_sessions_index(), encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        raise Fail("invalid_config", "会话索引 %s 损坏（%s）。删除该文件即可重新开始"
+                   % (_sessions_index(), e))
+    if not isinstance(data, dict):
+        raise Fail("invalid_config", "会话索引 %s 格式不对。删除该文件即可重新开始" % _sessions_index())
+    return data
+
+
+def save_sessions(data):
+    os.makedirs(SESSIONS_DIR, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".index_", suffix=".tmp", dir=SESSIONS_DIR)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, _sessions_index())
+    except Exception:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+
+
+def session_codex_home():
+    """会话专用的持久干净 CODEX_HOME。无法隔离时不开会话 —— 否则会话记录会写进
+    用户自己的 codex 目录，混进用户的会话历史。"""
+    enabled, reason = isolation_status()
+    if not enabled:
+        raise Fail("session_unavailable", "无法开启会话：%s" % reason)
+    home = os.path.join(SESSIONS_DIR, "codex-home")
+    os.makedirs(home, mode=0o700, exist_ok=True)
+    for d in (SESSIONS_DIR, home):
+        try:
+            os.chmod(d, 0o700)                    # 会话里有对话内容，只给用户本人读
+        except OSError:
+            pass
+    problem = _prepare_clean_home(home)
+    if problem:
+        raise Fail("session_unavailable", "无法开启会话：%s" % problem)
+    LAST_CONTEXT.update(clean=True, reason=None)
+    return home
+
+
+def codex_delete_session_files(thread_id):
+    """删掉会话专用 home 里这个会话的记录与生成的图片，返回删除的记录文件数。"""
+    home = os.path.join(SESSIONS_DIR, "codex-home")
+    removed = 0
+    for dirpath, _, files in os.walk(os.path.join(home, "sessions")):
+        for fn in files:
+            if thread_id in fn:
+                os.remove(os.path.join(dirpath, fn))
+                removed += 1
+    shutil.rmtree(os.path.join(home, "generated_images", thread_id), ignore_errors=True)
+    return removed
 
 
 def api_models(timeout=30):
@@ -463,17 +574,9 @@ def _codex_failure(events):
     return None
 
 
-def codex_ask(exe, prompt, model, images, timeout):
-    """空目录 + 只读沙箱：把 Codex 当纯聊天模型，碰不到任何项目文件。
-    图片由 CLI 在客户端读取后随 prompt 上传，不受沙箱限制。
-    成功须同时满足：退出码 0、事件流无失败信号且这一轮正常结束、回答非空。"""
-    workdir = tempfile.mkdtemp(prefix="askgpt_")
-    out = os.path.join(workdir, "answer.md")
-    cmd = _codex_base(exe, workdir, "read-only", model, images) + ["--json", "-o", out]
-    with clean_codex_home() as home:
-        env = dict(os.environ, CODEX_HOME=home) if home else None
-        r = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
-                           timeout=timeout, cwd=workdir, env=env)
+def _codex_answer(r, out):
+    """从一次 codex exec 的结果里取回答。成功须同时满足：退出码 0、事件流无失败信号
+    且这一轮正常结束、回答非空。返回 (回答, 事件列表)。"""
     events = _codex_events(r.stdout)
     tail = (r.stderr or "").strip()[-900:]
     failure = _codex_failure(events)
@@ -495,7 +598,45 @@ def codex_ask(exe, prompt, model, images, timeout):
                 break
     if not ans:
         raise RuntimeError("codex exec 正常结束但没有给出回答。末尾输出：\n%s" % tail)
-    return ans
+    return ans, events
+
+
+def codex_ask(exe, prompt, model, images, timeout):
+    """空目录 + 只读沙箱：把 Codex 当纯聊天模型，碰不到任何项目文件。
+    图片由 CLI 在客户端读取后随 prompt 上传，不受沙箱限制。"""
+    with scratch_dir("askgpt_") as workdir:
+        out = os.path.join(workdir, "answer.md")
+        cmd = _codex_base(exe, workdir, "read-only", model, images) + ["--json", "-o", out]
+        with clean_codex_home() as home:
+            env = dict(os.environ, CODEX_HOME=home) if home else None
+            r = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
+                               timeout=timeout, cwd=workdir, env=env)
+        return _codex_answer(r, out)[0]
+
+
+def codex_session_ask(exe, prompt, model, images, timeout, thread_id=None):
+    """会话模式：在会话专用的干净 CODEX_HOME 里运行并保留会话记录。
+    thread_id 为空时开新会话，否则续接。续接不支持 -s / -C，只读沙箱由该目录的配置保证。
+    返回 (回答, thread_id)。"""
+    home = session_codex_home()
+    workdir = os.path.join(SESSIONS_DIR, "work")
+    os.makedirs(workdir, exist_ok=True)
+    if thread_id:
+        cmd = [exe, "exec", "resume", thread_id, "-", "--skip-git-repo-check"]
+    else:
+        cmd = [exe, "exec", "-", "--skip-git-repo-check", "-s", "read-only", "-C", workdir]
+    if model:
+        cmd += ["-m", model]
+    for img in images or []:
+        cmd += ["-i", img]
+    with scratch_dir("askgpt_") as tmp:
+        out = os.path.join(tmp, "answer.md")
+        r = subprocess.run(cmd + ["--json", "-o", out], input=prompt, capture_output=True,
+                           text=True, timeout=timeout, cwd=workdir,
+                           env=dict(os.environ, CODEX_HOME=home))
+        ans, events = _codex_answer(r, out)
+    tid = next((ev.get("thread_id") for ev in events if ev.get("type") == "thread.started"), None)
+    return ans, tid or thread_id
 
 
 def _image_problem(data):
@@ -518,11 +659,10 @@ def _image_problem(data):
 def render_context(exe, prompt, model):
     """渲染 GPT 实际会看到的上下文（codex debug prompt-input，不调用模型、不耗额度），
     并检查其中有没有用户的 AGENTS.md 与技能清单。"""
-    workdir = tempfile.mkdtemp(prefix="askgpt_ctx_")
     cmd = [exe, "debug", "prompt-input"]
     if model:
         cmd += ["-c", "model=%s" % json.dumps(model)]
-    with clean_codex_home() as home:
+    with scratch_dir("askgpt_ctx_") as workdir, clean_codex_home() as home:
         env = dict(os.environ, CODEX_HOME=home) if home else None
         r = subprocess.run(cmd + [prompt], capture_output=True, text=True,
                            timeout=120, cwd=workdir, env=env)
@@ -587,7 +727,11 @@ def codex_gen_image(exe, prompt, out_path, model, timeout):
     不让 codex 往工作目录写文件 —— 有的平台沙箱不允许（如 Windows 上的 WorkBuddy）。
     codex 自己会把生成的图存进 <CODEX_HOME>/generated_images/<会话 ID>/，这一步不经过沙箱，
     所以用只读沙箱运行，从 --json 事件流拿会话 ID，再去那里取图。"""
-    workdir = tempfile.mkdtemp(prefix="askgpt_img_")
+    with scratch_dir("askgpt_img_") as workdir:
+        _codex_gen_in(exe, prompt, out_path, model, timeout, workdir)
+
+
+def _codex_gen_in(exe, prompt, out_path, model, timeout, workdir):
     task = ("用你内置的图像生成工具画：\n%s\n\n"
             "生成即可，不要保存、复制或移动任何文件。" % prompt)
     cmd = _codex_base(exe, workdir, "read-only", model, None) + ["--json"]
@@ -665,6 +809,12 @@ def _extract_refusal(resp):
 
 
 def api_ask(prompt, model, images, timeout):
+    return api_ask_full(prompt, model, images, timeout)[0]
+
+
+def api_ask_full(prompt, model, images, timeout, previous_response_id=None, store=False):
+    """返回 (回答, response id)。默认 store=False：这次对话不在 OpenAI 服务端保存；
+    只有会话模式才保存，供下一轮用 previous_response_id 续接。"""
     if images:
         content = [{"type": "input_text", "text": prompt}]
         for p in images:
@@ -676,6 +826,9 @@ def api_ask(prompt, model, images, timeout):
         payload = {"model": model, "input": [{"role": "user", "content": content}]}
     else:
         payload = {"model": model, "input": prompt}
+    payload["store"] = store
+    if previous_response_id:
+        payload["previous_response_id"] = previous_response_id
     resp = _api_post("/responses", payload, timeout)
     # 成功须同时满足：没有 error、status 为 completed、有文本回答。
     # 任何一项不满足都报错 —— 绝不把原始响应当成「GPT 的回答」返回。
@@ -688,11 +841,23 @@ def api_ask(prompt, model, images, timeout):
                            % (status, "：" + json.dumps(detail, ensure_ascii=False) if detail else ""))
     text = _extract_text(resp)
     if text.strip():
-        return text
+        return text, resp.get("id")
     refusal = _extract_refusal(resp)
     if refusal:
         raise RuntimeError("GPT 拒绝回答：%s" % refusal)
     raise RuntimeError("OpenAI 响应里没有文本回答")
+
+
+def api_delete_response(response_id, timeout=30):
+    """结束 API 会话时删除服务端保存的响应；失败不报错，返回是否删除成功。"""
+    req = urllib.request.Request(API_BASE + "/responses/" + response_id, method="DELETE",
+                                 headers={"Authorization": "Bearer " + os.environ["OPENAI_API_KEY"]})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            r.read()
+        return True
+    except Exception:
+        return False
 
 
 def api_gen_image(prompt, out_path, image_model, size, timeout):
@@ -814,6 +979,13 @@ def _run(as_json):
     ap.add_argument("--context", action="append", metavar="FILE",
                     help="背景资料：讨论简报、待审原文、代码、数据片段（UTF-8 文本，可重复）。"
                          "GPT 看不到你们之前的对话，需要它知道的都放进来")
+    ap.add_argument("--session", metavar="NAME",
+                    help="多轮会话：同名第一次调用开新会话，之后续接，GPT 记得前几轮。"
+                         "适合反复打磨同一份东西；盲评不要用")
+    ap.add_argument("--blind", action="store_true",
+                    help="盲评 / 交叉验证：要求上下文干净（做不到就报错），且不能与 --session 同用")
+    ap.add_argument("--list-sessions", action="store_true", help="列出已有会话")
+    ap.add_argument("--end-session", metavar="NAME", help="结束会话并删除它的会话记录")
     ap.add_argument("--dry-run", action="store_true",
                     help="只拼出最终发给 GPT 的完整内容并输出，不调用 GPT")
     ap.add_argument("--see", action="append", metavar="IMG",
@@ -886,6 +1058,34 @@ def _run(as_json):
         return done({"action": "set", "config": cfg, "config_path": CONFIG_PATH,
                      "warnings": warnings},
                     "已写入 %s:\n%s" % (CONFIG_PATH, json.dumps(cfg, ensure_ascii=False, indent=2)))
+
+    if args.list_sessions:
+        sessions = load_sessions()
+        lines = ["%-20s %-5s %-16s %3d 轮  最近 %s" % (n, v.get("path"), v.get("model") or "-",
+                                                    v.get("turns", 0), v.get("updated", "-"))
+                 for n, v in sorted(sessions.items())] or ["没有会话"]
+        return done({"sessions": sessions, "sessions_dir": SESSIONS_DIR}, "\n".join(lines))
+
+    if args.end_session:
+        sessions = load_sessions()
+        ended = sessions.pop(args.end_session, None)
+        if ended is None:
+            raise Fail("bad_input", "没有名为 %s 的会话（--list-sessions 查看）" % args.end_session)
+        removed = {}
+        if ended.get("path") == "codex" and ended.get("thread_id"):
+            removed["local_files"] = codex_delete_session_files(ended["thread_id"])
+        elif ended.get("path") == "api":
+            ids = ended.get("response_ids") or []
+            removed["server_responses_total"] = len(ids)
+            removed["server_responses_deleted"] = (
+                sum(api_delete_response(r) for r in ids) if os.environ.get("OPENAI_API_KEY") else 0)
+        save_sessions(sessions)
+        if not any(v.get("path") == "codex" for v in sessions.values()):
+            # 没有 codex 会话了：整个会话目录删掉，连 codex 自己的数据库残留一起清
+            shutil.rmtree(os.path.join(SESSIONS_DIR, "codex-home"), ignore_errors=True)
+            shutil.rmtree(os.path.join(SESSIONS_DIR, "work"), ignore_errors=True)
+        return done({"action": "end_session", "name": args.end_session, "removed": removed},
+                    "已结束会话 %s，会话记录已删除" % args.end_session)
 
     if args.show_config:
         cfg = load_config()
@@ -984,6 +1184,14 @@ def _run(as_json):
         raise Fail("bad_args", "--gen 与 --see 不能同时使用")
     if args.gen and args.context:
         raise Fail("bad_args", "--gen 不支持 --context（把要画的内容直接写进描述）")
+    if args.blind and args.session:
+        raise Fail("bad_args", "--blind（盲评）不能与 --session 同用：会话里 GPT 会被前几轮锚定")
+    if args.session:
+        if not SESSION_NAME_RE.match(args.session):
+            raise Fail("bad_args", "会话名只能用字母、数字、- 和 _，最长 64 个字符")
+        if args.gen:
+            raise Fail("bad_args", "生图暂不支持会话：把要改的地方写进描述，重新生成即可")
+    REQUIRE_CLEAN["on"] = bool(args.blind)
 
     # 订阅路径会在临时空目录里运行 codex（隔离项目文件），相对路径在那里解析不到，
     # 所以一律先转成绝对路径。
@@ -1038,6 +1246,18 @@ def _run(as_json):
         raise Fail("path_unavailable", "当前路径为 api，但%s" % apst["detail"], path="api")
 
     model = resolve_model(path, args, cfg)
+    sessions, sess = {}, None
+    if args.session:
+        sessions = load_sessions()
+        sess = sessions.get(args.session)
+        if sess and sess.get("path") != path:
+            raise Fail("bad_args", "会话 %s 走的是 %s 路径，当前是 %s。换路径请换个会话名"
+                       % (args.session, sess.get("path"), path))
+        if sess and args.model and args.model != sess.get("model"):
+            raise Fail("bad_args", "会话 %s 用的是模型 %s。换模型请换个会话名"
+                       % (args.session, sess.get("model")))
+        # 会话里每一轮都明确指定同一个模型，署名与行为前后一致
+        model = (sess or {}).get("model") or model or (codex_default_model() if path == "codex" else None)
     image_model = (cfg.get("image_model") or os.environ.get("OPENAI_IMAGE_MODEL")
                    or FALLBACK_IMAGE_MODEL)
     model_tag = model or (codex_default_model() if path == "codex" else None) \
@@ -1069,22 +1289,45 @@ def _run(as_json):
             result = {"ok": True, "mode": "gen", "path": path, "billing": billing,
                       "model": used, "image": gen_out}
         else:
-            if path == "codex":
+            if args.session and path == "codex":
+                answer, tid = codex_session_ask(cx["exe"], prompt, model, see or None, args.timeout,
+                                                (sess or {}).get("thread_id"))
+                sess_state = {"thread_id": tid}
+            elif args.session:
+                answer, rid = api_ask_full(prompt, model, see or None, args.timeout,
+                                           previous_response_id=(sess or {}).get("last_response_id"),
+                                           store=True)
+                sess_state = {"last_response_id": rid,
+                              "response_ids": (sess or {}).get("response_ids", []) + [rid]}
+            elif path == "codex":
                 answer = codex_ask(cx["exe"], prompt, model, see or None, args.timeout)
             else:
                 answer = api_ask(prompt, model, see or None, args.timeout)
             result = {"ok": True, "mode": "see" if see else "ask", "path": path,
                       "billing": billing, "model": model_tag, "answer": answer,
                       "images_in": see, **sent}
+            if args.session:
+                now = time.strftime("%Y-%m-%d %H:%M:%S")
+                entry = dict(sess or {"path": path, "model": model, "created": now, "turns": 0})
+                entry.update(sess_state, updated=now, turns=entry.get("turns", 0) + 1)
+                sessions[args.session] = entry
+                save_sessions(sessions)
+                result["session"] = {"name": args.session, "turn": entry["turns"], "new": sess is None}
+    except Fail:
+        raise
     except subprocess.TimeoutExpired:
         result = {"ok": False, "error_code": "timeout", "path": path, "billing": billing,
                   "model": model_tag, "error": "超过 %d 秒未完成（--timeout 可调大）" % args.timeout}
     except Exception as e:
+        hint = ("（若会话记录已丢失，用 --end-session %s 清掉后重开）" % args.session
+                if args.session and sess else "")
         result = {"ok": False, "error_code": "call_failed", "path": path, "billing": billing,
-                  "model": model_tag, "error": str(e)}
+                  "model": model_tag, "error": str(e) + hint}
 
     # API 路径只发送用户的问题；codex 路径取决于本次是否成功隔离
     result["clean_context"] = True if path == "api" else LAST_CONTEXT["clean"]
+    if args.blind:
+        result["blind"] = True
     if path == "codex" and LAST_CONTEXT["clean"] is False:
         result["clean_context_reason"] = LAST_CONTEXT["reason"]
         if not as_json:
