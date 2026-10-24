@@ -34,7 +34,7 @@ python3 "$SCRIPT" --probe --json
 
 `--probe` **会请求模型目录**（`codex debug models` / `GET /v1/models`），但**不做任何模型推理**，不消耗推理额度。
 
-返回 `codex`（可用性、`auth_mode`、`billing`、所用客户端及版本、其他副本、默认模型、账号可用模型）、
+返回 `codex`（可用性、`auth_mode`、`billing`、`context_isolation`、所用客户端及版本、其他副本、默认模型、账号可用模型）、
 `api`、`configured`、`config`、`config_error`、`proxy`。
 
 **判断费用看 `codex.billing`，不要看路径名。** codex 用 ChatGPT 账号登录才是包月额度（`subscription`）；
@@ -90,7 +90,7 @@ python3 "$SCRIPT" --gen /tmp/askgpt/out.png "图像描述"         # 生图
 
 ```json
 {"ok": true, "mode": "ask", "path": "codex", "billing": "subscription",
- "model": "<实际使用的模型>", "answer": "…", "images_in": []}
+ "model": "<实际使用的模型>", "answer": "…", "images_in": [], "clean_context": true}
 ```
 
 `billing` 取值：`subscription`（包月额度）/ `per-token`（按 token 计费）/ `unknown`（无法确认）。
@@ -117,11 +117,23 @@ python3 "$SCRIPT" --gen /tmp/askgpt/out.png "图像描述"         # 生图
 `generated_images` 目录取图，**不需要沙箱有写权限**（Windows 等禁止写工作目录的环境也适用）。
 生成后把图展示给用户；医学示意图在图注注明"AI 生成，仅供参考"。
 
+## 盲评上下文隔离
+
+codex 默认会把用户的**全局 AGENTS.md、已装技能、插件、MCP、hooks、桌面控制工具**带进模型上下文 ——
+GPT 的"独立作答"其实先读了用户的个人指令。脚本默认隔离这些：每次调用都换一个临时的干净
+`CODEX_HOME`，只把登录凭据 `auth.json` 链接过去，配置里只保留用户的模型与推理强度，调用结束即删。
+
+- 结果里的 **`clean_context`** 告诉你这一次是否干净：`true` = 已隔离；`false` 时附 `clean_context_reason`
+- **做盲评 / 交叉验证前确认 `clean_context` 为 `true`**；为 `false` 时先告诉用户原因，不要把结果当成干净盲评呈现
+- 想核实 GPT 到底看到了什么：`python3 "$SCRIPT" --show-context "问题"`（只渲染上下文，不调用模型、不耗额度）
+- 用户明确希望 GPT 读到 AGENTS.md 时：设环境变量 `ASK_GPT_ISOLATE=0`
+- 剩下的 codex 基础提示词对所有用户都一样，不含个人内容；API 路径本来就只发送问题本身
+
 ## 让 GPT 参与工作流的几种方式
 
 1. **直接提问**：用户的问题原样转发，不加不减，回答标明出自 GPT。
 2. **第二意见 / 交叉验证（盲评）**：只发原始问题让 GPT 独立作答，**不要附上你已有的结论**，
-   避免锚定。拿到回答后由你对比，向用户汇报：一致点、分歧点、综合判断（分歧处给依据或文献线索）。
+   避免锚定；并确认返回的 `clean_context` 为 `true`。拿到回答后由你对比，向用户汇报：一致点、分歧点、综合判断（分歧处给依据或文献线索）。
 3. **审稿 / 对照润色**：prompt = 背景 + 待审文本 +「请指出错误、遗漏与可改进处，并给出修改版」。
    把 GPT 修改版与原文逐段对照（表格或 diff），交用户定稿 —— **不要擅自把两版合并**。
 4. **识图**：图和问题一起发；复杂影像先问清用户想让 GPT 看什么。

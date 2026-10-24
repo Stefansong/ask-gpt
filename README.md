@@ -79,10 +79,61 @@ sequenceDiagram
 | 方式 | 做法 |
 |---|---|
 | **直接提问** | 你的问题原样转发，不加不减，回答标明出自 GPT |
-| **第二意见（盲评）** | 只发原始问题让 GPT 独立作答，**不附上宿主 agent 的结论**，避免锚定；再汇报一致点、分歧点、综合判断 |
+| **第二意见（盲评）** | 只发原始问题让 GPT 独立作答，**不附上宿主 agent 的结论**，避免锚定；GPT 也看不到你的个人配置（见下节）；再汇报一致点、分歧点、综合判断 |
 | **审稿 / 对照润色** | GPT 修改版与原文逐段对照，交你定稿，**不擅自合并两版** |
 | **识图** | 图和问题一起发；复杂影像先问清你想让 GPT 看什么 |
 | **流水线中的一步** | 宿主起草 → GPT 审 → 宿主修改 → 你定稿；或 GPT 出图 → 宿主嵌入文档 |
+
+---
+
+## 盲评上下文隔离
+
+"盲评"要求 GPT 只看到问题本身。但 codex 默认会把你的**个人配置**一起交给模型。开发时用 `codex debug prompt-input` 把模型实际收到的输入导出来，发现了这些：
+
+| 混进上下文的东西 | 隔离前 | 隔离后 |
+|---|---|---|
+| 你的全局 `AGENTS.md` | ⚠️ 在（每次调用都会执行里面的 `say` 指令） | ✅ 不在 |
+| 你装的技能清单（12 个） | ⚠️ 10.6K 字 | ✅ 不在 |
+| 桌面控制工具 `mcp__cua_repl` | ⚠️ GPT 回答问题时手里有它 | ✅ 不在 |
+| 浏览器插件说明 | ⚠️ 34 处 | ✅ 不在 |
+| 推荐插件广告 | ⚠️ 在 | ✅ 不在 |
+| 总长度 | 73.8K 字符 | 61.3K 字符 |
+
+剩下的是 codex 的基础提示词和沙箱说明，**对所有用户都一样，不含个人内容**。API 路径本来就只发送问题本身。
+
+### 怎么做到的
+
+codex 的全局 `AGENTS.md` 放在 `CODEX_HOME` 里，**没有任何开关能单独关掉**（试过 `project_doc_max_bytes=0` 等，都只管项目目录里的 AGENTS.md）。所以：
+
+1. 每次调用都新建一个**临时的干净 `CODEX_HOME`**
+2. 只把登录凭据 `auth.json` **链接**过去，配置里只保留你的模型和推理强度
+3. 调用结束即删除
+
+为什么用链接而不是复制：codex 会定期刷新 token。如果写进副本，副本一删，新 token 就丢了，可能把你的主 codex 登出。实测 codex 会**顺着链接原地写回**原文件，所以链接是安全的。Windows 上没有权限建符号链接时，会自动退回硬链接。
+
+### 自己核实
+
+```bash
+python3 scripts/ask_gpt.py --show-context "这段讨论的结论成立吗？"
+```
+
+```
+GPT 实际会看到的上下文（共 61281 字符，未调用模型）：
+  [tools    ]  22309 字 | functions, clock, collaboration
+  [developer]  21544 字 | You are Codex, an agent based on GPT-6. …
+  [developer]   3882 字 | <permissions instructions> Filesystem sandboxing …
+  …
+  [user     ]     11 字 | 这段讨论的结论成立吗？
+
+你的 AGENTS.md：✅ 不在
+技能清单：    ✅ 不在
+结论：✅ 干净，适合盲评
+```
+
+只渲染上下文，**不调用模型、不耗额度**。每次调用的 `--json` 结果里也有 `clean_context` 字段。
+
+- 想让 GPT 读到你的 AGENTS.md：设 `ASK_GPT_ISOLATE=0`
+- 无法隔离时（比如凭据存在系统钥匙串里、或链接都建不了），会照常调用，但 `clean_context` 为 `false` 并附原因，**不会假装是干净的**
 
 ---
 
@@ -406,6 +457,7 @@ python3 scripts/ask_gpt.py --json "Reply with exactly: OK"
 | `path` | `codex` 或 `api` |
 | `billing` | `subscription`（包月额度）/ `per-token`（按 token 计费）/ `unknown`（无法确认）—— **判断费用看它，不看路径名** |
 | `model` | **实际使用的模型名**，署名就用它 |
+| `clean_context` | 这次 GPT 是否只看到了问题本身（没有你的 AGENTS.md / 技能 / 插件）；盲评前确认它为 `true` |
 | `answer` / `image` | 文本回答 / 生成图片的绝对路径 |
 
 **所有失败都是同一种结构**，包括参数错误。agent 按 `error_code` 分支即可，不必解析错误文本：
@@ -508,6 +560,8 @@ python3 scripts/ask_gpt.py --reset-config
 | `--json` 下所有错误为统一结构 | ✅ 11 种错误场景 | ✅ |
 | 配置文件损坏或字段非法时明确报错 | ✅ | ✅ |
 | 相对路径的 `CODEX_HOME` / `ASK_GPT_CODEX` | ✅ 真实调用 | — |
+| 盲评上下文隔离（不含 AGENTS.md / 技能 / 插件） | ✅ `prompt-input` 前后对比 + 真实调用中 codex 未执行任何命令 | ✅ 只发送问题 |
+| 隔离的边界情况（硬链接回退、无法隔离时如实标记、用后清理） | ✅ 16 项单元测试 | — |
 
 - **API 路径的真实响应未经真机验证** —— 开发环境没有 API Key
 - **宿主 agent**：在 Claude Code 中实测通过；Kimi Code 已核对 skill 格式兼容，尚未实际运行；**WorkBuddy（Windows）**实测发现订阅生图因沙箱禁止写工作目录而失败，v4.2 已改为只读沙箱方案，修复后**尚未在 Windows 上复测**。如果你在别的 agent 里跑通了（或踩到坑），欢迎开 issue
@@ -613,6 +667,17 @@ API 返回 `status: incomplete`（被截断）、`failed` 或拒答时，提取�
 订阅路径原本让 codex 在 `workspace-write` 沙箱里把图写进工作目录再取回。WorkBuddy 在 Windows 上实测时，沙箱不允许写工作目录，这一步就断了。
 
 其实 codex 自己会把生成的图存到 `$CODEX_HOME/generated_images/<会话 ID>/`，这一步不经过沙箱。现在生图改用**只读沙箱**，从 `--json` 事件流的 `thread.started` 拿会话 ID，直接去那里取图 —— 不再需要任何写权限。
+
+</details>
+
+<details>
+<summary><b>9. GPT 的"独立作答"先读了你的个人指令</b></summary>
+
+用户的全局 `~/.codex/AGENTS.md` 里写着"完成任务后执行 `say Mission Completed`"。结果每次用 ask-gpt 问 GPT 一个问题，电脑都会念一句"Mission Completed"。
+
+这个现象本身无害，但它暴露了一件更要紧的事：**codex 把你的个人指令、技能清单，甚至桌面控制工具都交给了 GPT**。所谓"盲评"并不盲，个人指令里写的偏好、语气、规则都会影响 GPT 的"第二意见"。
+
+现在每次调用都在临时的干净 `CODEX_HOME` 里运行（见「盲评上下文隔离」）。
 
 </details>
 

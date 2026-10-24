@@ -26,9 +26,11 @@
 """
 import argparse
 import base64
+import contextlib
 import json
 import mimetypes
 import re
+import shutil
 import os
 import subprocess
 import sys
@@ -274,19 +276,89 @@ def codex_version(exe):
         return None
 
 
-def codex_default_model():
-    """读 <CODEX_HOME>/config.toml 顶层的 model =，仅用于署名，不修改它。"""
+def _codex_config_value(key):
+    """读用户 <CODEX_HOME>/config.toml 顶层的 key = "value"。只读，不修改。"""
     try:
         with open(os.path.join(codex_home(), "config.toml"), encoding="utf-8") as f:
             for line in f:
                 if line.lstrip().startswith("["):  # 进入子表就停，只看顶层
                     break
-                m = re.match(r'\s*model\s*=\s*"([^"]+)"', line)
+                m = re.match(r'\s*%s\s*=\s*"([^"]+)"' % re.escape(key), line)
                 if m:
                     return m.group(1)
     except Exception:
         pass
     return None
+
+
+def codex_default_model():
+    return _codex_config_value("model")
+
+
+# ---------- 盲评上下文隔离 ----------
+#
+# codex 会把用户的全局 AGENTS.md（就在 CODEX_HOME 里）、已装的技能、插件、MCP、hooks
+# 都带进模型上下文，没有开关能单独关掉全局 AGENTS.md。所以每次调用都换一个临时的干净
+# CODEX_HOME，只把登录凭据 auth.json 链接过去，配置里只保留用户的模型与推理强度。
+
+ISOLATED_FEATURES = """
+[features]
+recommended_plugins = false
+plugins = false
+apps = false
+browser_use = false
+computer_use = false
+hooks = false
+
+[skills]
+include_instructions = false
+"""
+
+LAST_CONTEXT = {"clean": None, "reason": None}
+
+
+def isolation_status():
+    if os.environ.get("ASK_GPT_ISOLATE", "1") == "0":
+        return False, "已用 ASK_GPT_ISOLATE=0 关闭隔离"
+    auth = os.path.join(codex_home(), "auth.json")
+    if not os.path.isfile(auth):
+        return False, "登录凭据不在 %s（可能存于系统钥匙串），无法隔离" % auth
+    return True, None
+
+
+@contextlib.contextmanager
+def clean_codex_home():
+    """产出一个临时的干净 CODEX_HOME（或 None = 本次未隔离），用完即删。
+    auth.json 用链接指向真实文件：codex 刷新 token 时会顺着链接原地写回（已验证），
+    不会写进副本、随临时目录一起丢掉，从而把用户的主登录弄失效。"""
+    enabled, reason = isolation_status()
+    if not enabled:
+        LAST_CONTEXT.update(clean=False, reason=reason)
+        yield None
+        return
+    iso = tempfile.mkdtemp(prefix="askgpt_home_")
+    try:
+        real_auth, link = os.path.join(codex_home(), "auth.json"), os.path.join(iso, "auth.json")
+        try:
+            os.symlink(real_auth, link)
+        except OSError:
+            try:
+                os.link(real_auth, link)          # Windows 无权限建符号链接时退回硬链接
+            except OSError:
+                LAST_CONTEXT.update(clean=False, reason="无法链接登录凭据（符号链接与硬链接都不可用），本次未隔离")
+                yield None
+                return
+        top = ""
+        for key in ("model", "model_reasoning_effort"):   # 只沿用「用哪个模型、想多深」
+            v = _codex_config_value(key)
+            if v:
+                top += "%s = %s\n" % (key, json.dumps(v))
+        with open(os.path.join(iso, "config.toml"), "w", encoding="utf-8") as f:
+            f.write("# ask-gpt 生成的隔离配置，调用结束即删除\n" + top + ISOLATED_FEATURES)
+        LAST_CONTEXT.update(clean=True, reason=None)
+        yield iso
+    finally:
+        shutil.rmtree(iso, ignore_errors=True)    # 只删链接本身，不碰真实的 auth.json
 
 
 def api_models(timeout=30):
@@ -338,6 +410,8 @@ def probe():
     except Fail as e:
         cfg, cfg_err = {}, e.message
     cx, ap = codex_state(), api_state()
+    iso_on, iso_reason = isolation_status()
+    cx["context_isolation"] = {"enabled": iso_on, "reason": iso_reason}
     cx["installs"] = codex_installs()
     cx["models"] = codex_models() if cx["available"] else []
     ap["models"] = api_models() if ap["available"] else []
@@ -396,8 +470,10 @@ def codex_ask(exe, prompt, model, images, timeout):
     workdir = tempfile.mkdtemp(prefix="askgpt_")
     out = os.path.join(workdir, "answer.md")
     cmd = _codex_base(exe, workdir, "read-only", model, images) + ["--json", "-o", out]
-    r = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
-                       timeout=timeout, cwd=workdir)
+    with clean_codex_home() as home:
+        env = dict(os.environ, CODEX_HOME=home) if home else None
+        r = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
+                           timeout=timeout, cwd=workdir, env=env)
     events = _codex_events(r.stdout)
     tail = (r.stderr or "").strip()[-900:]
     failure = _codex_failure(events)
@@ -439,6 +515,51 @@ def _image_problem(data):
     return "不是 PNG / JPEG / GIF / WEBP"
 
 
+def render_context(exe, prompt, model):
+    """渲染 GPT 实际会看到的上下文（codex debug prompt-input，不调用模型、不耗额度），
+    并检查其中有没有用户的 AGENTS.md 与技能清单。"""
+    workdir = tempfile.mkdtemp(prefix="askgpt_ctx_")
+    cmd = [exe, "debug", "prompt-input"]
+    if model:
+        cmd += ["-c", "model=%s" % json.dumps(model)]
+    with clean_codex_home() as home:
+        env = dict(os.environ, CODEX_HOME=home) if home else None
+        r = subprocess.run(cmd + [prompt], capture_output=True, text=True,
+                           timeout=120, cwd=workdir, env=env)
+    if r.returncode != 0:
+        raise RuntimeError("codex debug prompt-input 失败：%s" % (r.stderr or r.stdout).strip()[-300:])
+    raw = r.stdout
+    data = json.loads(raw)
+    items = data if isinstance(data, list) else (data.get("input") or [])
+    segments = []
+    for it in items:
+        if it.get("tools") is not None:
+            segments.append({"role": "tools", "chars": len(json.dumps(it, ensure_ascii=False)),
+                             "summary": ", ".join(t.get("name") or t.get("type") or "?"
+                                                  for t in it["tools"])})
+            continue
+        for c in it.get("content") or []:
+            t = (c.get("text") or "").strip()
+            if t:
+                segments.append({"role": it.get("role"), "chars": len(t),
+                                 "summary": t[:80].replace("\n", " ")})
+    user_agents = ""
+    try:
+        with open(os.path.join(codex_home(), "AGENTS.md"), encoding="utf-8") as f:
+            user_agents = f.read().strip()
+    except OSError:
+        pass
+    return {
+        "clean_context": LAST_CONTEXT["clean"],
+        "clean_context_reason": LAST_CONTEXT["reason"],
+        "agents_md_present": "AGENTS.md instructions" in raw
+                             or bool(user_agents and user_agents[:40] in raw),
+        "skills_list_present": "<skills_instructions>" in raw,
+        "total_chars": len(raw),
+        "segments": segments,
+    }
+
+
 def _looks_like_image(data):
     return _image_problem(data) is None
 
@@ -470,8 +591,14 @@ def codex_gen_image(exe, prompt, out_path, model, timeout):
     task = ("用你内置的图像生成工具画：\n%s\n\n"
             "生成即可，不要保存、复制或移动任何文件。" % prompt)
     cmd = _codex_base(exe, workdir, "read-only", model, None) + ["--json"]
-    r = subprocess.run(cmd, input=task, capture_output=True, text=True,
-                       timeout=timeout, cwd=workdir)
+    with clean_codex_home() as home:
+        env = dict(os.environ, CODEX_HOME=home) if home else None
+        r = subprocess.run(cmd, input=task, capture_output=True, text=True,
+                           timeout=timeout, cwd=workdir, env=env)
+        _pick_generated_image(r, home or codex_home(), workdir, out_path)
+
+
+def _pick_generated_image(r, home, workdir, out_path):
     events = _codex_events(r.stdout)
     tail = (r.stderr or "").strip()[-600:]
     failure = _codex_failure(events)
@@ -482,7 +609,7 @@ def codex_gen_image(exe, prompt, out_path, model, timeout):
                       if ev.get("type") == "thread.started"), None)
     candidates = []
     if thread_id:
-        gen_dir = os.path.join(codex_home(), "generated_images", thread_id)
+        gen_dir = os.path.join(home, "generated_images", thread_id)
         if os.path.isdir(gen_dir):
             candidates += [os.path.join(gen_dir, f) for f in os.listdir(gen_dir)]
     # 旧版 codex 可能把图直接落在工作目录
@@ -665,6 +792,8 @@ def _run(as_json):
     ap.add_argument("--probe", action="store_true",
                     help="探测路径、登录方式与可用模型。会请求模型目录（codex debug models / "
                          "GET /v1/models），但不做任何模型推理，不消耗推理额度")
+    ap.add_argument("--show-context", action="store_true",
+                    help="渲染 GPT 实际会看到的上下文并检查是否干净（不调用模型、不耗额度）")
     ap.add_argument("--list-models", action="store_true",
                     help="列出当前路径实际可用的模型（运行时从账号拉取，非硬编码）")
     ap.add_argument("--json", action="store_true",
@@ -765,6 +894,9 @@ def _run(as_json):
             print("Codex CLI:   %s — %s" % ("可用" if cx["available"] else "不可用", cx["detail"]))
             if cx["available"]:
                 print("  计费: %s" % BILLING_TEXT[cx["billing"]])
+                ci = cx["context_isolation"]
+                print("  上下文隔离: %s" % ("✅ 开启 —— GPT 看不到你的 AGENTS.md / 技能 / 插件 / MCP"
+                                            if ci["enabled"] else "⚠️ 关闭 —— " + ci["reason"]))
             if cx.get("version"):
                 print("  使用: %s (%s) | 默认模型: %s"
                       % (cx["exe"], cx["version"], cx.get("default_model") or "未设置"))
@@ -782,6 +914,35 @@ def _run(as_json):
                 print("已配置: %s" % (json.dumps(st["config"], ensure_ascii=False)
                                       if st["configured"] else "否（需先选路径）"))
         return 0 if avail else 2
+
+    if args.show_context:
+        cfg = load_config()
+        cx = codex_state()
+        path = args.path or cfg.get("path") or ("codex" if cx["available"] else "api")
+        prompt = args.prompt or "（你的问题）"
+        if path == "api":
+            return done({"path": "api", "clean_context": True, "agents_md_present": False,
+                         "skills_list_present": False,
+                         "segments": [{"role": "user", "chars": len(prompt), "summary": prompt[:80]}]},
+                        "API 路径只发送你的问题（和图片），没有任何其他上下文。")
+        if not cx["available"]:
+            raise Fail("path_unavailable", "Codex 不可用：%s" % cx["detail"], path="codex")
+        model = args.model or cfg.get("model")
+        try:
+            ctx = render_context(cx["exe"], prompt, model)
+        except Exception as e:
+            raise Fail("call_failed", str(e), status=1)
+        lines = ["GPT 实际会看到的上下文（共 %d 字符，未调用模型）：" % ctx["total_chars"]]
+        for seg in ctx["segments"]:
+            lines.append("  [%-9s] %6d 字 | %s" % (seg["role"], seg["chars"], seg["summary"]))
+        clean = ctx["clean_context"] and not ctx["agents_md_present"] and not ctx["skills_list_present"]
+        lines.append("")
+        lines.append("你的 AGENTS.md：%s" % ("⚠️ 在上下文里" if ctx["agents_md_present"] else "✅ 不在"))
+        lines.append("技能清单：    %s" % ("⚠️ 在上下文里" if ctx["skills_list_present"] else "✅ 不在"))
+        lines.append("结论：%s" % ("✅ 干净，适合盲评" if clean else
+                                   "⚠️ 不干净" + ("（%s）" % ctx["clean_context_reason"]
+                                                  if ctx["clean_context_reason"] else "")))
+        return done(dict(ctx, path="codex", clean=clean), "\n".join(lines))
 
     # ---------- 调用 ----------
     if args.gen and args.see:
@@ -835,6 +996,7 @@ def _run(as_json):
                 print("提示：%s 的元数据未标注图像输入能力，读图可能失败。" % model, file=sys.stderr)
                 break
 
+    LAST_CONTEXT.update(clean=None, reason=None)
     billing = (cx.get("billing") or "unknown") if path == "codex" else "per-token"
     path_label = {
         ("codex", "subscription"): "ChatGPT 订阅 via codex exec",
@@ -865,6 +1027,14 @@ def _run(as_json):
     except Exception as e:
         result = {"ok": False, "error_code": "call_failed", "path": path, "billing": billing,
                   "model": model_tag, "error": str(e)}
+
+    # API 路径只发送用户的问题；codex 路径取决于本次是否成功隔离
+    result["clean_context"] = True if path == "api" else LAST_CONTEXT["clean"]
+    if path == "codex" and LAST_CONTEXT["clean"] is False:
+        result["clean_context_reason"] = LAST_CONTEXT["reason"]
+        if not as_json:
+            print("提示：本次未隔离上下文（%s），GPT 可能读到你的 AGENTS.md 等个人配置。"
+                  % LAST_CONTEXT["reason"], file=sys.stderr)
 
     # --json：给任意 agent 解析用的稳定结构；否则沿用人类可读格式
     #（回答走 stdout，路径/模型标注走 stderr，方便管道里只取回答）
