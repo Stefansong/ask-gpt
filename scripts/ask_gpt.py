@@ -736,6 +736,36 @@ def read_prompt(args):
     return text
 
 
+CONTEXT_CHAR_LIMIT = 1500000
+
+
+def read_context_files(paths):
+    """读 --context 附上的背景资料（讨论简报、待审原文、代码、数据片段），须为 UTF-8 文本。"""
+    out = []
+    for p in paths or []:
+        full = os.path.abspath(os.path.expanduser(p))
+        try:
+            with open(full, encoding="utf-8") as f:
+                out.append((full, f.read()))
+        except UnicodeDecodeError:
+            raise Fail("bad_input", "%s 不是 UTF-8 文本文件（图片请用 --see）" % p)
+        except OSError as e:
+            raise Fail("bad_input", "读不到背景文件 %s：%s" % (p, e.strerror or e))
+    return out
+
+
+def assemble_prompt(task, contexts):
+    """GPT 看不到宿主 agent 与用户之前的对话，它知道的只有这里拼出来的内容。
+    背景与任务用标签分开，避免 GPT 把背景资料当成要回答的问题。"""
+    if not contexts:
+        return task
+    files = "\n\n".join('<file name="%s">\n%s\n</file>' % (os.path.basename(p), t.strip())
+                         for p, t in contexts)
+    return ("The <background> section is reference material for the task below. "
+            "It is not itself a question.\n\n"
+            "<background>\n%s\n</background>\n\n<task>\n%s\n</task>" % (files, task.strip()))
+
+
 class _Parser(argparse.ArgumentParser):
     """参数错误时，--json 模式也输出统一的 JSON 错误，而不是 argparse 的纯文本用法说明。"""
     def error(self, message):
@@ -781,6 +811,11 @@ def _run(as_json):
     ap = _Parser(description="调用你的 OpenAI 订阅 / API 问 GPT（问答 / 读图 / 生图）")
     ap.add_argument("prompt", nargs="?", help="问题文本；缺省时从 -f 或 stdin 读")
     ap.add_argument("-f", "--file", help="从文件读完整 prompt（长内容推荐）")
+    ap.add_argument("--context", action="append", metavar="FILE",
+                    help="背景资料：讨论简报、待审原文、代码、数据片段（UTF-8 文本，可重复）。"
+                         "GPT 看不到你们之前的对话，需要它知道的都放进来")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="只拼出最终发给 GPT 的完整内容并输出，不调用 GPT")
     ap.add_argument("--see", action="append", metavar="IMG",
                     help="读图：把图片随问题发给 GPT；多张就重复 --see")
     ap.add_argument("--gen", metavar="OUT.png", help="生图：图片存到此路径")
@@ -919,7 +954,7 @@ def _run(as_json):
         cfg = load_config()
         cx = codex_state()
         path = args.path or cfg.get("path") or ("codex" if cx["available"] else "api")
-        prompt = args.prompt or "（你的问题）"
+        prompt = assemble_prompt(args.prompt or "（你的问题）", read_context_files(args.context))
         if path == "api":
             return done({"path": "api", "clean_context": True, "agents_md_present": False,
                          "skills_list_present": False,
@@ -947,6 +982,37 @@ def _run(as_json):
     # ---------- 调用 ----------
     if args.gen and args.see:
         raise Fail("bad_args", "--gen 与 --see 不能同时使用")
+    if args.gen and args.context:
+        raise Fail("bad_args", "--gen 不支持 --context（把要画的内容直接写进描述）")
+
+    # 订阅路径会在临时空目录里运行 codex（隔离项目文件），相对路径在那里解析不到，
+    # 所以一律先转成绝对路径。
+    see = [os.path.abspath(os.path.expanduser(p)) for p in (args.see or [])]
+    missing = [p for p in see if not os.path.isfile(p)]
+    if missing:
+        raise Fail("bad_input", "图片不存在：%s" % ", ".join(missing))
+    gen_out = os.path.abspath(os.path.expanduser(args.gen)) if args.gen else None
+    if gen_out and not os.path.isdir(os.path.dirname(gen_out)):
+        raise Fail("bad_input", "生图输出目录不存在：%s" % os.path.dirname(gen_out))
+    contexts = read_context_files(args.context)
+    prompt = assemble_prompt(read_prompt(args), contexts)
+    if len(prompt) > CONTEXT_CHAR_LIMIT:
+        raise Fail("bad_input", "发给 GPT 的内容共 %d 字符，超过上限 %d。请先摘要背景资料"
+                   % (len(prompt), CONTEXT_CHAR_LIMIT))
+    sent = {"prompt_chars": len(prompt), "context_files": [p for p, _ in contexts]}
+
+    # --dry-run 在选路径之前返回：只是拼内容给人看，不需要登录
+    if args.dry_run:
+        if as_json:
+            print(json.dumps(dict({"ok": True, "dry_run": True, "prompt": prompt,
+                                   "images_in": see}, **sent), ensure_ascii=False, indent=2))
+        else:
+            print(prompt)
+            print("\n[未调用 GPT：共 %d 字符，背景文件 %d 个%s]"
+                  % (len(prompt), len(contexts), "，图片 %d 张" % len(see) if see else ""),
+                  file=sys.stderr)
+        return 0
+
     cfg = load_config()
     cx, apst = codex_state(), api_state()
     path = args.path or cfg.get("path")
@@ -970,17 +1036,6 @@ def _run(as_json):
                    path="codex")
     if path == "api" and not apst["available"]:
         raise Fail("path_unavailable", "当前路径为 api，但%s" % apst["detail"], path="api")
-
-    # 订阅路径会在临时空目录里运行 codex（隔离项目文件），相对路径在那里解析不到，
-    # 所以一律先转成绝对路径。
-    see = [os.path.abspath(os.path.expanduser(p)) for p in (args.see or [])]
-    missing = [p for p in see if not os.path.isfile(p)]
-    if missing:
-        raise Fail("bad_input", "图片不存在：%s" % ", ".join(missing))
-    gen_out = os.path.abspath(os.path.expanduser(args.gen)) if args.gen else None
-    if gen_out and not os.path.isdir(os.path.dirname(gen_out)):
-        raise Fail("bad_input", "生图输出目录不存在：%s" % os.path.dirname(gen_out))
-    prompt = read_prompt(args)
 
     model = resolve_model(path, args, cfg)
     image_model = (cfg.get("image_model") or os.environ.get("OPENAI_IMAGE_MODEL")
@@ -1020,7 +1075,7 @@ def _run(as_json):
                 answer = api_ask(prompt, model, see or None, args.timeout)
             result = {"ok": True, "mode": "see" if see else "ask", "path": path,
                       "billing": billing, "model": model_tag, "answer": answer,
-                      "images_in": see}
+                      "images_in": see, **sent}
     except subprocess.TimeoutExpired:
         result = {"ok": False, "error_code": "timeout", "path": path, "billing": billing,
                   "model": model_tag, "error": "超过 %d 秒未完成（--timeout 可调大）" % args.timeout}

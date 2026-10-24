@@ -86,6 +86,86 @@ sequenceDiagram
 
 ---
 
+## 把讨论背景交给 GPT
+
+**GPT 每次都从零开始。** 它看不到你和宿主 agent 之前的对话，读不到你的文件，也不记得上一轮问过什么。它只知道这一次发过去的内容。
+
+不给背景会怎样？用一份虚构的研究简报实测，问一个只在讨论里出现过的研究代号：
+
+| | GPT 的回答 |
+|---|---|
+| **不带背景** | "BLUEFIN 研究实际纳入 63 人，主要终点为镜片发放后第 1 天的戴入舒适度评分" —— **自信地答成了一项同名的无关试验** |
+| **带上背景简报** | "研究代号 BLUEFIN，样本量 312 例，主要终点为术后 2 年生化复发（连续两次 PSA ≥ 0.2 ng/mL）"，随后针对这项研究给出了回应选择偏倚的建议 |
+
+所以要让 GPT 知道讨论和进展，由宿主 agent 写一份**背景简报**交给它：
+
+```mermaid
+%%{init: {"flowchart": {"nodeSpacing": 26, "rankSpacing": 34}}}%%
+flowchart LR
+    C(["💬 你和宿主 Agent<br/>的讨论"]) --> B("📝 宿主 Agent<br/>写背景简报")
+    F("📎 原始材料<br/>段落 / 代码 / 数据") --> P
+    B --> P{{"ask_gpt.py<br/>拼装背景与任务"}}
+    P --> G(["✨ GPT"])
+    G --> R("回答回到<br/>同一个对话")
+    R -.->|追问时写进进展| B
+
+    classDef conv fill:#3949ab,stroke:#1a237e,color:#fff,stroke-width:2px
+    classDef step fill:#eceff1,stroke:#90a4ae,color:#263238
+    classDef tool fill:#5e35b1,stroke:#311b92,color:#fff,stroke-width:2px
+    classDef gpt  fill:#263238,stroke:#1de9b6,color:#fff,stroke-width:3px
+    class C conv
+    class B,F,R step
+    class P tool
+    class G gpt
+```
+
+```bash
+python3 scripts/ask_gpt.py --context brief.md --context methods_draft.md \
+  "列出研究代号和样本量，再建议讨论部分如何回应选择偏倚的质疑"
+```
+
+简报模板（`brief.md`）：
+
+```markdown
+## 背景：我们在做什么（1–3 句）
+## 已确定的事实与材料：数据、约束、关键参数、已读文献
+## 进展：做过什么、结果如何（上一轮 GPT 的回答也写在这里，注明出自 GPT）
+## 当前卡点 / 未决问题
+```
+
+脚本会把背景和任务用标签分开，GPT 不会把背景资料当成要回答的问题：
+
+```
+<background>
+<file name="brief.md"> … </file>
+<file name="methods_draft.md"> … </file>
+</background>
+
+<task>
+列出研究代号和样本量……
+</task>
+```
+
+### 简报怎么写
+
+| 原则 | 为什么 |
+|---|---|
+| **按需摘要，不照搬对话** | 寒暄、弯路、已推翻的方案只会稀释重点 |
+| **原文给原文** | 待审段落、代码、数据逐字附上；转述会混进宿主 agent 自己的理解 |
+| **盲评时只给事实，不给判断** | 保留背景、数据、约束，删掉"我们认为……"之类的结论，否则 GPT 会被锚定 |
+| **病例数据先去标识化** | 简报会离开你的电脑 |
+| **追问时更新「进展」** | 脚本不保留 GPT 的会话，上一轮的问答要写进简报 |
+
+发出前想确认 GPT 到底会收到什么：
+
+```bash
+python3 scripts/ask_gpt.py --dry-run --context brief.md "任务"
+```
+
+只把最终内容打印出来，**不调用 GPT**，也不需要登录。`--json` 的结果里，`prompt_chars` 与 `context_files` 记录了每次实际发了多少、带了哪些文件。
+
+---
+
 ## 盲评上下文隔离
 
 "盲评"要求 GPT 只看到问题本身。但 codex 默认会把你的**个人配置**一起交给模型。开发时用 `codex debug prompt-input` 把模型实际收到的输入导出来，发现了这些：
@@ -458,6 +538,7 @@ python3 scripts/ask_gpt.py --json "Reply with exactly: OK"
 | `billing` | `subscription`（包月额度）/ `per-token`（按 token 计费）/ `unknown`（无法确认）—— **判断费用看它，不看路径名** |
 | `model` | **实际使用的模型名**，署名就用它 |
 | `clean_context` | 这次 GPT 是否只看到了问题本身（没有你的 AGENTS.md / 技能 / 插件）；盲评前确认它为 `true` |
+| `prompt_chars` / `context_files` | 实际发给 GPT 的字符数、附带的背景文件 |
 | `answer` / `image` | 文本回答 / 生成图片的绝对路径 |
 
 **所有失败都是同一种结构**，包括参数错误。agent 按 `error_code` 分支即可，不必解析错误文本：
@@ -562,6 +643,8 @@ python3 scripts/ask_gpt.py --reset-config
 | 相对路径的 `CODEX_HOME` / `ASK_GPT_CODEX` | ✅ 真实调用 | — |
 | 盲评上下文隔离（不含 AGENTS.md / 技能 / 插件） | ✅ `prompt-input` 前后对比 + 真实调用中 codex 未执行任何命令 | ✅ 只发送问题 |
 | 隔离的边界情况（硬链接回退、无法隔离时如实标记、用后清理） | ✅ 16 项单元测试 | — |
+| 背景简报送达 GPT（不带 / 带背景对照） | ✅ 不带时答错成同名无关试验，带上后事实全对 | ✅ 同一拼装逻辑 |
+| `--dry-run` 不需要登录 | ✅ | ✅ |
 
 - **API 路径的真实响应未经真机验证** —— 开发环境没有 API Key
 - **宿主 agent**：在 Claude Code 中实测通过；Kimi Code 已核对 skill 格式兼容，尚未实际运行；**WorkBuddy（Windows）**实测发现订阅生图因沙箱禁止写工作目录而失败，v4.2 已改为只读沙箱方案，修复后**尚未在 Windows 上复测**。如果你在别的 agent 里跑通了（或踩到坑），欢迎开 issue
