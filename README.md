@@ -47,17 +47,25 @@ ask-gpt 让 GPT **直接在当前对话里**参与进来：宿主 agent 负责�
 
 ```mermaid
 sequenceDiagram
+    autonumber
     actor U as 你
-    participant A as 宿主 Agent
-    participant S as ask_gpt.py
-    participant G as GPT
+    box rgba(0,121,107,0.10) 你的电脑
+        participant A as 宿主 Agent
+        participant S as ask_gpt.py
+    end
+    box rgba(255,179,0,0.12) OpenAI
+        participant G as GPT
+    end
 
     U->>A: 写讨论部分，再让 GPT 审一遍
     A->>A: 起草段落
-    A->>S: --json -f draft.md
-    S->>G: 订阅额度 或 API
-    G-->>S: 审稿意见与修改版
-    S-->>A: JSON 结果 ok / model / answer
+    rect rgba(94,53,177,0.10)
+        Note over A,G: 交给 GPT 的一步
+        A->>S: --json -f draft.md
+        S->>G: 订阅额度 或 API
+        G-->>S: 审稿意见与修改版
+        S-->>A: ok / model / answer
+    end
     A->>U: 原文与 GPT 修改版逐段对照
     U->>A: 采纳第 2、4 条
     A->>A: 按意见修改
@@ -109,27 +117,38 @@ CODEX_HOME=/path/to/.codex  ASK_GPT_CODEX=/path/to/codex  python3 scripts/ask_gp
 每次都问"你有订阅还是 API"很烦；完全不问又会在费用上替你做决定。所以按探测结果分流，**只在真正需要决策时才开口**：
 
 ```mermaid
+%%{init: {"flowchart": {"curve": "basis", "nodeSpacing": 30, "rankSpacing": 45}}}%%
 flowchart TD
-    A(["技能被触发"]) --> B["probe 探测<br/>不发任何请求"]
-    B --> C{"已配置过?"}
-    C -->|是| Z(["直接调用<br/>不打扰用户"])
-    C -->|否| D{"哪些路径可用"}
-    D -->|仅订阅可用| E["用订阅<br/>一句话告知"]
-    D -->|仅 API 可用| F["用 API<br/>提醒按 token 计费"]
-    D -->|两条都可用| G["停下来询问用户<br/>费用差异大"]
-    D -->|都不可用| H["给出两条安装指引<br/>问用户走哪条"]
-    E --> J["写入 config.json"]
-    F --> J
-    G --> J
+    A(["⚡ 技能被触发"]) --> B("🔍 probe 探测<br/>不发任何请求")
+    B --> C{"已配置过？"}
+    C ==>|是| Z(["✅ 直接调用"])
+    C -->|否| D{"哪些路径可用？"}
+    D -->|只有订阅| E("用订阅<br/>一句话告知")
+    D -->|只有 API| F("用 API<br/>提醒按 token 计费")
+    D -->|两条都有| G("🙋 问你选哪条<br/>费用差异大")
+    D -->|都没有| H("🙋 给出安装指引<br/>问你走哪条")
+    E & F & G --> J("💾 写入 config.json")
     J --> Z
-    H --> B
+    H -.->|配置好后| B
 
-    style G fill:#f9a825,color:#000
-    style H fill:#f9a825,color:#000
-    style Z fill:#2e7d32,color:#fff
+    classDef entry  fill:#3949ab,stroke:#1a237e,color:#fff,stroke-width:2px
+    classDef step   fill:#eceff1,stroke:#90a4ae,color:#263238
+    classDef decide fill:#ede7f6,stroke:#7e57c2,color:#311b92,stroke-width:2px
+    classDef sub    fill:#00796b,stroke:#004d40,color:#fff
+    classDef api    fill:#ffb300,stroke:#ff8f00,color:#3e2723
+    classDef user   fill:#c2185b,stroke:#880e4f,color:#fff,stroke-width:2px
+    classDef done   fill:#2e7d32,stroke:#1b5e20,color:#fff,stroke-width:2px
+
+    class A entry
+    class B,J step
+    class C,D decide
+    class E sub
+    class F api
+    class G,H user
+    class Z done
 ```
 
-<sub>🟡 黄色 = 需要你参与的节点，其余全自动</sub>
+<sub>玫红色节点需要你参与，其余全自动 ｜ 青色 = 订阅路径，琥珀色 = API 路径</sub>
 
 ### 脚本绝不等 stdin
 
@@ -143,22 +162,57 @@ flowchart TD
 ## 架构：一套命令，两条路径
 
 ```mermaid
+%%{init: {"flowchart": {"curve": "basis", "nodeSpacing": 24, "rankSpacing": 40}}}%%
 flowchart LR
-    subgraph UI["统一命令面（只需记这三条）"]
+    AG(["🤖 宿主 Agent<br/>Claude Code · Kimi Code · …"])
+
+    subgraph CMD["统一命令面"]
         direction TB
-        Q["问答<br/>ask_gpt.py 你的问题"]
-        S["读图<br/>--see 图.png"]
-        G["生图<br/>--gen out.png"]
+        Q("💬 问答")
+        V("👁️ 读图 --see")
+        P("🎨 生图 --gen")
     end
 
-    UI --> R{"路由层<br/>config.json"}
+    R{{"🔀 路由<br/>config.json"}}
 
-    R -->|path = codex| SUB["订阅路径<br/>codex exec 只读沙箱<br/>-i 多图输入<br/>内置 image_gen<br/>包月额度，零额外账单"]
-    R -->|path = api| API["API 路径<br/>POST /v1/responses<br/>input_image base64<br/>gpt-image-2<br/>按 token 计费"]
+    subgraph SUBP["订阅路径 · 包月额度，零额外账单"]
+        direction TB
+        S1("codex exec 只读沙箱")
+        S2("-i 多图输入")
+        S3("内置 image_gen")
+    end
 
-    style SUB fill:#00695c,color:#fff
-    style API fill:#e65100,color:#fff
-    style R fill:#4527a0,color:#fff
+    subgraph APIP["API 路径 · 按 token 计费"]
+        direction TB
+        A1("POST /v1/responses")
+        A2("input_image base64")
+        A3("gpt-image-2")
+    end
+
+    M(["✨ GPT<br/>模型按账号实时拉取"])
+
+    AG --> CMD --> R
+    R -->|codex| SUBP
+    R -->|api| APIP
+    SUBP --> M
+    APIP --> M
+
+    classDef agent  fill:#3949ab,stroke:#1a237e,color:#fff,stroke-width:2px
+    classDef cmd    fill:#eceff1,stroke:#90a4ae,color:#263238
+    classDef router fill:#5e35b1,stroke:#311b92,color:#fff,stroke-width:2px
+    classDef sub    fill:#00796b,stroke:#004d40,color:#fff
+    classDef api    fill:#ffb300,stroke:#ff8f00,color:#3e2723
+    classDef gpt    fill:#263238,stroke:#1de9b6,color:#fff,stroke-width:3px
+
+    class AG agent
+    class Q,V,P cmd
+    class R router
+    class S1,S2,S3 sub
+    class A1,A2,A3 api
+    class M gpt
+    style CMD  fill:#90a4ae1f,stroke:#90a4ae,stroke-dasharray:4 3
+    style SUBP fill:#00796b1f,stroke:#00796b,stroke-width:2px
+    style APIP fill:#ffb3001f,stroke:#ff8f00,stroke-width:2px
 ```
 
 | 能力 | 订阅路径 `codex` | API 路径 `api` |
