@@ -45,18 +45,18 @@ Claude 很强，但有三类场景它一个人干不了：
 
 ```mermaid
 flowchart TD
-    A([技能被触发]) --> B["ask_gpt.py --probe --json<br/>探测，不发任何请求"]
-    B --> C{已配置过?}
-    C -->|是| Z([直接调用，不打扰用户])
-    C -->|否| D{哪些路径可用}
-    D -->|仅订阅可用| E[用订阅<br/>一句话告知]
-    D -->|仅 API 可用| F[用 API<br/>提醒按 token 计费]
-    D -->|两条都可用| G[/停下来询问用户<br/>费用差异大/]
-    D -->|都不可用| H[/给出两条安装指引<br/>问用户走哪条/]
-    E --> I[/再询问模型<br/>sol / terra / luna/]
+    A(["技能被触发"]) --> B["probe 探测<br/>不发任何请求"]
+    B --> C{"已配置过?"}
+    C -->|是| Z(["直接调用<br/>不打扰用户"])
+    C -->|否| D{"哪些路径可用"}
+    D -->|仅订阅可用| E["用订阅<br/>一句话告知"]
+    D -->|仅 API 可用| F["用 API<br/>提醒按 token 计费"]
+    D -->|两条都可用| G["停下来询问用户<br/>费用差异大"]
+    D -->|都不可用| H["给出两条安装指引<br/>问用户走哪条"]
+    E --> I["再询问模型<br/>sol / terra / luna"]
     F --> I
     G --> I
-    I --> J["--set-path / --set-model<br/>写入 config.json"]
+    I --> J["写入 config.json"]
     J --> Z
     H --> B
 
@@ -83,17 +83,17 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    subgraph UI["统一命令面（用户只需记这三条）"]
+    subgraph UI["统一命令面（只需记这三条）"]
         direction TB
-        Q["问答<br/><code>ask_gpt.py '问题'</code>"]
-        S["读图<br/><code>--see 图.png</code>"]
-        G["生图<br/><code>--gen out.png</code>"]
+        Q["问答<br/>ask_gpt.py 你的问题"]
+        S["读图<br/>--see 图.png"]
+        G["生图<br/>--gen out.png"]
     end
 
-    UI --> R{{"路由层<br/>~/.config/ask-gpt/config.json"}}
+    UI --> R{"路由层<br/>config.json"}
 
-    R -->|path = codex| SUB["<b>订阅路径</b><br/>codex exec 只读沙箱<br/>-i 多图输入<br/>内置 image_gen<br/>── 包月额度，零额外账单"]
-    R -->|path = api| API["<b>API 路径</b><br/>POST /v1/responses<br/>input_image base64<br/>gpt-image-2<br/>── 按 token 计费"]
+    R -->|path = codex| SUB["订阅路径<br/>codex exec 只读沙箱<br/>-i 多图输入<br/>内置 image_gen<br/>包月额度，零额外账单"]
+    R -->|path = api| API["API 路径<br/>POST /v1/responses<br/>input_image base64<br/>gpt-image-2<br/>按 token 计费"]
 
     style SUB fill:#00695c,color:#fff
     style API fill:#e65100,color:#fff
