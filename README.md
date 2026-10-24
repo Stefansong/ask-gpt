@@ -102,8 +102,8 @@ sequenceDiagram
 ```mermaid
 %%{init: {"flowchart": {"nodeSpacing": 30, "rankSpacing": 36}}}%%
 flowchart TB
-    C(["💬 你和宿主 Agent<br/>的讨论"]) --> B("📝 宿主 Agent<br/>写背景简报")
-    F("📎 原始材料<br/>段落 · 代码 · 数据")
+    C(["💬 你和 Agent<br/>之前的讨论"]) --> B("📝 宿主 Agent<br/>写背景简报")
+    F("📎 待审原文<br/>代码 · 数据")
     B --> P{{"ask_gpt.py<br/>拼装背景与任务"}}
     F --> P
     P --> G(["✨ GPT"])
